@@ -1,0 +1,296 @@
+// prisma/schema.prisma
+generator client {
+  provider = "prisma-client-js"
+}
+
+datasource db {
+  provider = "postgresql"
+  url      = env("DATABASE_URL")
+}
+
+enum UserRole {
+  STUDENT
+  ADMIN
+}
+
+enum CourseStatus {
+  DRAFT
+  PUBLISHED
+  ARCHIVED
+}
+
+enum OrderStatus {
+  PENDING
+  PAID
+  CANCELLED
+  EXPIRED
+  REFUNDED
+}
+
+enum PaymentStatus {
+  CREATED
+  AUTHORIZED
+  CAPTURED
+  FAILED
+  REFUNDED
+}
+
+enum PromoType {
+  PERCENTAGE
+  FIXED
+}
+
+enum RedemptionStatus {
+  RESERVED
+  APPLIED
+  RELEASED
+}
+
+enum WebhookStatus {
+  RECEIVED
+  PROCESSING
+  PROCESSED
+  FAILED
+}
+
+enum EnquiryStatus {
+  NEW
+  IN_PROGRESS
+  CLOSED
+}
+
+model User {
+  id            String           @id @default(cuid())
+  email         String           @unique @db.VarChar(254)
+  name          String           @db.VarChar(120)
+  passwordHash  String?
+  emailVerified DateTime?
+  role          UserRole         @default(STUDENT)
+  createdAt     DateTime         @default(now())
+  updatedAt     DateTime         @updatedAt
+  enrollments   Enrollment[]
+  progress      LessonProgress[]
+  orders        Order[]
+  redemptions   PromoRedemption[]
+
+  @@map("users")
+}
+
+model Course {
+  id          String       @id @default(cuid())
+  slug        String       @unique
+  title       String
+  summary     String
+  description String       @db.Text
+  imageUrl    String?
+  pricePaise  Int
+  currency    String       @default("INR") @db.Char(3)
+  status      CourseStatus @default(DRAFT)
+  createdAt   DateTime     @default(now())
+  updatedAt   DateTime     @updatedAt
+  modules     Module[]
+  enrollments Enrollment[]
+  orders      Order[]
+  promoCodes  PromoCode[]
+
+  @@index([status, createdAt])
+  @@map("courses")
+}
+
+model Module {
+  id        String   @id @default(cuid())
+  courseId  String
+  title     String
+  position  Int
+  createdAt DateTime @default(now())
+  updatedAt DateTime @updatedAt
+  course    Course   @relation(fields: [courseId], references: [id], onDelete: Restrict)
+  lessons   Lesson[]
+
+  @@unique([courseId, position])
+  @@map("modules")
+}
+
+model Lesson {
+  id              String           @id @default(cuid())
+  moduleId        String
+  title           String
+  position        Int
+  content         String?          @db.Text
+  videoAssetId    String?
+  durationSeconds Int              @default(0)
+  isPreview       Boolean          @default(false)
+  createdAt       DateTime         @default(now())
+  updatedAt       DateTime         @updatedAt
+  module          Module           @relation(fields: [moduleId], references: [id], onDelete: Restrict)
+  progress        LessonProgress[]
+
+  @@unique([moduleId, position])
+  @@map("lessons")
+}
+
+model Enrollment {
+  id          String    @id @default(cuid())
+  userId      String
+  courseId    String
+  orderId     String?   @unique
+  enrolledAt  DateTime  @default(now())
+  expiresAt   DateTime?
+  revokedAt   DateTime?
+  user        User      @relation(fields: [userId], references: [id], onDelete: Restrict)
+  course      Course    @relation(fields: [courseId], references: [id], onDelete: Restrict)
+  order       Order?    @relation(fields: [orderId], references: [id], onDelete: Restrict)
+
+  @@unique([userId, courseId])
+  @@index([courseId])
+  @@map("enrollments")
+}
+
+model LessonProgress {
+  id              String    @id @default(cuid())
+  userId          String
+  lessonId        String
+  positionSeconds Int       @default(0)
+  completedAt     DateTime?
+  updatedAt       DateTime  @updatedAt
+  user            User      @relation(fields: [userId], references: [id], onDelete: Cascade)
+  lesson          Lesson    @relation(fields: [lessonId], references: [id], onDelete: Cascade)
+
+  @@unique([userId, lessonId])
+  @@index([lessonId])
+  @@map("lesson_progress")
+}
+
+model Order {
+  id                 String          @id @default(cuid())
+  idempotencyKey     String          @unique
+  userId             String
+  courseId           String
+  courseTitle        String
+  subtotalPaise      Int
+  discountPaise      Int             @default(0)
+  totalPaise         Int
+  currency           String          @default("INR") @db.Char(3)
+  status             OrderStatus     @default(PENDING)
+  razorpayOrderId    String?         @unique
+  expiresAt          DateTime
+  paidAt             DateTime?
+  createdAt          DateTime        @default(now())
+  updatedAt          DateTime        @updatedAt
+  user               User            @relation(fields: [userId], references: [id], onDelete: Restrict)
+  course             Course          @relation(fields: [courseId], references: [id], onDelete: Restrict)
+  payments           Payment[]
+  enrollment         Enrollment?
+  promoRedemption    PromoRedemption?
+
+  @@index([userId, createdAt])
+  @@index([courseId])
+  @@index([status, expiresAt])
+  @@map("orders")
+}
+
+model Payment {
+  id                String        @id @default(cuid())
+  orderId           String
+  razorpayPaymentId String        @unique
+  amountPaise       Int
+  refundedPaise     Int           @default(0)
+  currency          String        @default("INR") @db.Char(3)
+  status            PaymentStatus @default(CREATED)
+  failureCode       String?
+  capturedAt        DateTime?
+  createdAt         DateTime      @default(now())
+  updatedAt         DateTime      @updatedAt
+  order             Order         @relation(fields: [orderId], references: [id], onDelete: Restrict)
+
+  @@index([orderId, status])
+  @@map("payments")
+}
+
+model PromoCode {
+  id               String            @id @default(cuid())
+  // Store normalized uppercase ASCII codes.
+  code             String            @unique @db.VarChar(64)
+  type             PromoType
+  // PERCENTAGE: basis points (100 = 1%); FIXED: paise.
+  value            Int
+  maxDiscountPaise Int?
+  minSubtotalPaise Int               @default(0)
+  usageLimit       Int?
+  perUserLimit     Int?
+  courseId         String?
+  active           Boolean           @default(true)
+  startsAt         DateTime?
+  expiresAt        DateTime?
+  createdAt        DateTime          @default(now())
+  updatedAt        DateTime          @updatedAt
+  course           Course?           @relation(fields: [courseId], references: [id], onDelete: Restrict)
+  redemptions      PromoRedemption[]
+
+  @@index([courseId])
+  @@map("promo_codes")
+}
+
+model PromoRedemption {
+  id                   String           @id @default(cuid())
+  promoCodeId          String
+  userId               String
+  orderId              String           @unique
+  codeSnapshot         String
+  discountPaise        Int
+  status               RedemptionStatus @default(RESERVED)
+  reservationExpiresAt DateTime
+  appliedAt            DateTime?
+  createdAt            DateTime         @default(now())
+  updatedAt            DateTime         @updatedAt
+  promoCode            PromoCode        @relation(fields: [promoCodeId], references: [id], onDelete: Restrict)
+  user                 User             @relation(fields: [userId], references: [id], onDelete: Restrict)
+  order                Order            @relation(fields: [orderId], references: [id], onDelete: Restrict)
+
+  @@index([promoCodeId, status, reservationExpiresAt])
+  @@index([promoCodeId, userId, status])
+  @@index([userId])
+  @@map("promo_redemptions")
+}
+
+model WebhookEvent {
+  id              String        @id @default(cuid())
+  provider        String        @default("razorpay")
+  providerEventId String
+  eventType       String
+  payload         Json
+  status          WebhookStatus @default(RECEIVED)
+  attempts        Int           @default(0)
+  lockedUntil     DateTime?
+  lastError       String?       @db.Text
+  receivedAt      DateTime      @default(now())
+  processedAt     DateTime?
+  updatedAt       DateTime      @updatedAt
+
+  @@unique([provider, providerEventId])
+  @@index([status, lockedUntil, receivedAt])
+  @@map("webhook_events")
+}
+
+model Enquiry {
+  id        String        @id @default(cuid())
+  name      String        @db.VarChar(120)
+  email     String        @db.VarChar(254)
+  phone     String?       @db.VarChar(32)
+  subject   String        @db.VarChar(200)
+  message   String        @db.Text
+  status    EnquiryStatus @default(NEW)
+  createdAt DateTime      @default(now())
+  updatedAt DateTime      @updatedAt
+
+  @@index([status, createdAt])
+  @@map("enquiries")
+}
+
+model Setting {
+  key       String   @id @db.VarChar(100)
+  value     Json
+  updatedAt DateTime @updatedAt
+
+  @@map("settings")
+}

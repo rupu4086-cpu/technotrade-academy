@@ -1,0 +1,25 @@
+# dependencies
+node_modules/
+.pnp
+.pnp.*
+
+# build output
+.next/
+out/
+build/
+dist/
+
+# env / secrets — NEVER commit real keys
+.env
+.env.*
+!.env.example
+
+# prisma
+*.db
+*.db-journal
+
+# misc
+.DS_Store
+*.log
+coverage/
+.vercel
