@@ -1,15 +1,16 @@
-// Sign in with an email code (Supabase OTP), the same sign-in the Courses
-// page uses. After the code is verified, the token is exchanged at
-// /api/auth/session for the academy_session cookie, then the user is sent
-// to the page they came from (default /learn). No password is used.
-
+// Log in — email + password (primary). Email-code sign-in is still
+// available as an alternative, via the OTP route used before.
 "use client";
 
+import Link from "next/link";
 import { useEffect, useState, type FormEvent } from "react";
+import { SiteNav, SiteFooter, pageWrap, cardStyle, inputStyle, buttonStyle } from "@/lib/nav";
 
 export default function LoginPage() {
   const [email, setEmail] = useState("");
+  const [password, setPassword] = useState("");
   const [code, setCode] = useState("");
+  const [otpMode, setOtpMode] = useState(false);
   const [sent, setSent] = useState(false);
   const [busy, setBusy] = useState(false);
   const [message, setMessage] = useState("");
@@ -20,34 +21,41 @@ export default function LoginPage() {
     if (value && value.startsWith("/")) setNext(value);
   }, []);
 
-  async function submit(event: FormEvent<HTMLFormElement>) {
+  async function submitPassword(event: FormEvent<HTMLFormElement>) {
+    event.preventDefault();
+    setBusy(true);
+    setMessage("");
+    try {
+      const response = await fetch("/api/auth/login", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ email, password }),
+      });
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Log in failed.");
+      window.location.href = next;
+    } catch (error) {
+      setMessage(error instanceof Error ? error.message : "Log in failed.");
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  async function submitOtp(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setBusy(true);
     setMessage("");
     try {
       const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
       const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-      if (!url || !key) throw new Error("Sign-in is temporarily unavailable.");
-      const response = await fetch(
-        `${url}/auth/v1/${sent ? "verify" : "otp"}`,
-        {
-          method: "POST",
-          headers: { "Content-Type": "application/json", apikey: key },
-          body: JSON.stringify(
-            sent
-              ? { email, token: code, type: "email" }
-              : { email, create_user: true },
-          ),
-        },
-      );
+      if (!url || !key) throw new Error("Email-code sign-in is temporarily unavailable.");
+      const response = await fetch(`${url}/auth/v1/${sent ? "verify" : "otp"}`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json", apikey: key },
+        body: JSON.stringify(sent ? { email, token: code, type: "email" } : { email, create_user: true }),
+      });
       const data = await response.json();
-      if (!response.ok) {
-        throw new Error(
-          sent
-            ? "The code is invalid or expired. Please try again."
-            : "Unable to send a code. Please wait and try again.",
-        );
-      }
+      if (!response.ok) throw new Error(sent ? "The code is invalid or expired." : "Unable to send a code.");
       if (!sent) {
         setSent(true);
         setMessage("Check your email for your sign-in code.");
@@ -69,58 +77,57 @@ export default function LoginPage() {
   }
 
   return (
-    <main style={{ maxWidth: 440, margin: "64px auto", padding: 24 }}>
-      <h1>Sign in — TechnoTrade Academy</h1>
-      <p>
-        We email you a one-time code. No password is used. Admin access is
-        only for the owner email configured for the academy.
-      </p>
-      <form onSubmit={submit} style={{ display: "grid", gap: 16 }}>
-        <label>
-          Email address
-          <input
-            type="email"
-            autoComplete="email"
-            required
-            value={email}
-            disabled={sent || busy}
-            onChange={(event) => setEmail(event.target.value)}
-          />
-        </label>
-        {sent && (
-          <label>
-            Email code
-            <input
-              inputMode="numeric"
-              autoComplete="one-time-code"
-              required
-              minLength={6}
-              maxLength={10}
-              value={code}
-              onChange={(event) => setCode(event.target.value)}
-            />
-          </label>
-        )}
-        <button type="submit" disabled={busy}>
-          {busy ? "Please wait…" : sent ? "Verify code" : "Email me a sign-in code"}
-        </button>
-        {sent && (
-          <button
-            type="button"
-            disabled={busy}
-            onClick={() => {
-              setSent(false);
-              setCode("");
-            }}
-          >
-            Use another email / resend
-          </button>
-        )}
-      </form>
-      {message && <p role="status">{message}</p>}
-      <p>
-        <a href="/">Back to home</a> · <a href="/courses">Browse courses</a>
-      </p>
-    </main>
+    <>
+      <SiteNav />
+      <main style={pageWrap}>
+        <div style={{ maxWidth: 480, margin: "auto" }}>
+          <h1 style={{ fontSize: 34 }}>Welcome back</h1>
+          <p style={{ lineHeight: 1.7, color: "#526174" }}>Log in with your email and password to continue learning.</p>
+          {!otpMode ? (
+            <form onSubmit={submitPassword} style={cardStyle}>
+              <label style={{ display: "block", marginBottom: 16 }}>
+                Email address
+                <input style={inputStyle} type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" required />
+              </label>
+              <label style={{ display: "block", marginBottom: 16 }}>
+                Password
+                <input style={inputStyle} type="password" value={password} onChange={(e) => setPassword(e.target.value)} autoComplete="current-password" required />
+              </label>
+              <button type="submit" style={buttonStyle} disabled={busy}>{busy ? "Please wait…" : "Log in"}</button>
+              {message && <p role="status" style={{ color: "#b91c1c" }}>{message}</p>}
+              <p>
+                <button type="button" onClick={() => { setOtpMode(true); setMessage(""); }} style={{ background: "none", border: 0, color: "#0f766e", cursor: "pointer", padding: 0, font: "inherit" }}>
+                  Sign in with an email code instead
+                </button>
+              </p>
+            </form>
+          ) : (
+            <form onSubmit={submitOtp} style={cardStyle}>
+              <label style={{ display: "block", marginBottom: 16 }}>
+                Email address
+                <input style={inputStyle} type="email" value={email} onChange={(e) => setEmail(e.target.value)} autoComplete="email" required disabled={sent || busy} />
+              </label>
+              {sent && (
+                <label style={{ display: "block", marginBottom: 16 }}>
+                  Email code
+                  <input style={inputStyle} inputMode="numeric" autoComplete="one-time-code" required minLength={6} maxLength={10} value={code} onChange={(e) => setCode(e.target.value)} />
+                </label>
+              )}
+              <button type="submit" style={buttonStyle} disabled={busy}>{busy ? "Please wait…" : sent ? "Verify code" : "Email me a sign-in code"}</button>
+              {message && <p role="status">{message}</p>}
+              <p>
+                <button type="button" onClick={() => { setOtpMode(false); setSent(false); setCode(""); setMessage(""); }} style={{ background: "none", border: 0, color: "#0f766e", cursor: "pointer", padding: 0, font: "inherit" }}>
+                  Back to password sign-in
+                </button>
+              </p>
+            </form>
+          )}
+          <p style={{ marginTop: 16 }}>
+            New here? <Link href="/signup">Create an account</Link>
+          </p>
+        </div>
+      </main>
+      <SiteFooter />
+    </>
   );
 }

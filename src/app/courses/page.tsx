@@ -2,7 +2,7 @@
 "use client";
 
 import Link from "next/link";
-import { useEffect, useRef, useState, type FormEvent } from "react";
+import { useEffect, useRef, useState } from "react";
 
 type Category = "All" | "Stock" | "Crypto" | "Forex" | "Psychology" | "Advanced";
 type Course = { id: string; title: string; category: Exclude<Category, "All">; description: string; price: number; level: string };
@@ -40,9 +40,7 @@ export default function Courses() {
   const [selected, setSelected] = useState<Course | null>(null);
   const [promo, setPromo] = useState("");
   const [email, setEmail] = useState("");
-  const [code, setCode] = useState("");
-  const [sent, setSent] = useState(false);
-  const [session, setSession] = useState<{ token: string; email: string } | null>(null);
+  const [session, setSession] = useState<{ email: string } | null>(null);
   const [busy, setBusy] = useState(false);
   const [loading, setLoading] = useState(true);
   const [message, setMessage] = useState("");
@@ -54,6 +52,10 @@ export default function Courses() {
     const initial = new URLSearchParams(window.location.search).get("category");
     if (categories.includes(initial as Category)) setCategory(initial as Category);
     const controller = new AbortController();
+    fetch("/api/auth/me", { signal: controller.signal })
+      .then((response) => response.json())
+      .then((data) => { if (data.signedIn) { setSession({ email: data.email }); setEmail(data.email); } })
+      .catch(() => undefined);
     fetch("/api/checkout", { signal: controller.signal })
       .then(async response => {
         if (!response.ok) throw new Error("Could not load courses. Please refresh.");
@@ -64,34 +66,12 @@ export default function Courses() {
     return () => controller.abort();
   }, []);
 
-  async function authenticate(event: FormEvent<HTMLFormElement>) {
-    event.preventDefault();
-    setBusy(true); setMessage("");
-    try {
-      const url = process.env.NEXT_PUBLIC_SUPABASE_URL;
-      const key = process.env.NEXT_PUBLIC_SUPABASE_ANON_KEY;
-      if (!url || !key) throw new Error("Sign-in is temporarily unavailable.");
-      // Configure Supabase's email template to include {{ .Token }}.
-      const response = await fetch(`${url}/auth/v1/${sent ? "verify" : "otp"}`, {
-        method: "POST",
-        headers: { "Content-Type": "application/json", apikey: key },
-        body: JSON.stringify(sent ? { email, token: code, type: "email" } : { email, create_user: true }),
-      });
-      const data = await response.json();
-      if (!response.ok) throw new Error(sent ? "The code is invalid or expired. Please try again." : "Unable to send a code. Please wait and try again.");
-      if (sent) {
-        if (!data.access_token || !data.user?.email) throw new Error("Sign-in could not be completed.");
-        setSession({ token: data.access_token, email: data.user.email });
-        setMessage("Signed in. Continue to secure checkout.");
-      } else { setSent(true); setMessage("Check your email for your sign-in code."); }
-    } catch (error) { setMessage(error instanceof Error ? error.message : "Sign-in failed."); }
-    finally { setBusy(false); }
-  }
 
   async function api(body: object) {
     const response = await fetch("/api/checkout", {
       method: "POST",
-      headers: { "Content-Type": "application/json", Authorization: `Bearer ${session?.token || ""}` },
+      headers: { "Content-Type": "application/json" },
+      credentials: "include",
       body: JSON.stringify(body),
     });
     const data = await response.json();
@@ -147,7 +127,7 @@ export default function Courses() {
 
   return (
     <main className="catalog">
-      <header><Link href="/" className="brand">↗ TechnoTrade Academy</Link><Link href="/">← Back to home</Link></header>
+      <header><Link href="/" className="brand">↗ TechnoTrade Academy</Link><span><Link href="/pricing">Pricing</Link> · <Link href="/community">Community</Link> · <Link href="/learn">My Learning</Link> · <Link href="/login">Log in</Link> · <Link href="/signup">Sign Up</Link></span></header>
       <section className="heading"><p className="eyebrow">INVEST IN YOUR UNDERSTANDING</p><h1>A stronger process<br />starts with <em>learning.</em></h1><p>Explore focused courses for every stage of your trading education.<br />No signals. No promises of profit. Just a clearer way forward.</p></section>
       <section aria-label="Course catalog">
         <div className="toolbar">
@@ -163,7 +143,8 @@ export default function Courses() {
             </article>
           ))}
         </div>
-        {!loading && !visible.length && <p className="empty">No courses match your search. Try another topic or filter.</p>}
+        {!loading && !courses.length && <p className="empty">Courses coming soon. No published courses are available yet — the owner adds courses from the separate admin app.</p>}
+        {!loading && courses.length > 0 && !visible.length && <p className="empty">No courses match your search. Try another topic or filter.</p>}
       </section>
       <div className="status" aria-live="polite">{message}</div>
       {pending && <button className="primary" disabled={busy} onClick={() => void verify(pending)}>{busy ? "Checking…" : "Check payment again"}</button>}
@@ -174,7 +155,7 @@ export default function Courses() {
         <button className="close" aria-label="Close checkout" disabled={busy} onClick={() => dialog.current?.close()}>×</button>
         <p className="eyebrow">YOUR NEXT CHAPTER</p><h2>{selected?.title}</h2><p>{selected?.description}</p><p className="price">{selected && money(selected.price)} <small>INR · One-time payment</small></p>
         {selected && owned.includes(selected.id) ? <p>Your account has access to this course.</p> : <>
-          {!session ? <form onSubmit={authenticate}><p>Sign in securely to associate your purchase with your account.</p><label>Email address<input type="email" autoComplete="email" required value={email} disabled={sent || busy} onChange={event => setEmail(event.target.value)} /></label>{sent && <label>Email code<input inputMode="numeric" autoComplete="one-time-code" required minLength={6} maxLength={10} value={code} onChange={event => setCode(event.target.value)} /></label>}<button className="primary" disabled={busy}>{busy ? "Please wait…" : sent ? "Verify email" : "Email me a sign-in code"}</button>{sent && <button type="button" className="secondary" disabled={busy} onClick={() => { setSent(false); setCode(""); }}>Use another email / resend</button>}</form> : <><p>Signed in as {session.email}</p><label>Promo code (optional)<input value={promo} maxLength={40} onChange={event => setPromo(event.target.value.toUpperCase())} disabled={busy} /></label><p className="fine">Promo codes are validated on the server. Review the final amount in Razorpay before paying. Access stays locked until payment is verified as captured.</p><button className="primary" disabled={busy || !!pending} onClick={() => void checkout()}>{busy ? "Preparing checkout…" : "Continue to Razorpay ↗"}</button></>}
+          {!session ? <><p>Sign in securely to associate your purchase with your account.</p><p><Link href="/login">Log in</Link> or <Link href="/signup">create an account</Link> — it takes a minute, and your course will be linked to your account.</p></> : <><p>Signed in as {session.email}</p><label>Promo code (optional)<input value={promo} maxLength={40} onChange={event => setPromo(event.target.value.toUpperCase())} disabled={busy} /></label><p className="fine">Promo codes are validated on the server. Review the final amount in Razorpay before paying. Access stays locked until payment is verified as captured.</p><button className="primary" disabled={busy || !!pending} onClick={() => void checkout()}>{busy ? "Preparing checkout…" : "Continue to Razorpay ↗"}</button></>}
         </>}
         <p role="status" className="fine">{message}</p>
       </dialog>

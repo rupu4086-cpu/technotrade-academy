@@ -11,7 +11,7 @@ export default function AboutPage() {
     <main>
       <nav aria-label="Main navigation">
         <a href="/">TechnoTrade Academy</a>
-        <span><a href="/contact">Contact</a><a href="/checkout">Course checkout</a></span>
+        <span><a href="/courses">Courses</a><a href="/pricing">Pricing</a><a href="/community">Community</a><a href="/contact">Contact</a><a href="/signup">Sign Up</a><a href="/login">Log in</a></span>
       </nav>
       <header>
         <img src="/logo.svg" alt="TechnoTrade Academy — Learn Trade Grow" width="370" height="90" />

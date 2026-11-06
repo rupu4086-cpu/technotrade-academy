@@ -15,15 +15,33 @@ const faqs = [
 export default function Home() {
   const [prepared, setPrepared] = useState(false);
 
-  function enquire(event: FormEvent<HTMLFormElement>) {
+  const [enquiryStatus, setEnquiryStatus] = useState("");
+  const [enquiryBusy, setEnquiryBusy] = useState(false);
+
+  async function enquire(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
-    const data = new FormData(event.currentTarget);
-    const subject = encodeURIComponent(`Course enquiry: ${data.get("interest")}`);
-    const body = encodeURIComponent(
-      `Name: ${data.get("name")}\nEmail: ${data.get("email")}\n\n${data.get("message")}`,
-    );
-    window.location.href = `mailto:${process.env.NEXT_PUBLIC_SUPPORT_EMAIL || "hello@technotrade.academy"}?subject=${subject}&body=${body}`;
-    setPrepared(true);
+    setEnquiryBusy(true);
+    setEnquiryStatus("");
+    try {
+      const data = new FormData(event.currentTarget);
+      const response = await fetch("/api/enquiries", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({
+          name: data.get("name"),
+          email: data.get("email"),
+          message: `${data.get("interest")}: ${data.get("message")}`,
+        }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Could not send your enquiry.");
+      setPrepared(true);
+      setEnquiryStatus("Thanks — your enquiry has been saved. We will reply within two business days.");
+    } catch (error) {
+      setEnquiryStatus(error instanceof Error ? error.message : "Could not send your enquiry.");
+    } finally {
+      setEnquiryBusy(false);
+    }
   }
 
   return (
@@ -34,8 +52,11 @@ export default function Home() {
         </Link>
         <nav aria-label="Main navigation">
           <Link href="/courses">Courses</Link>
-          <a href="#path">Our approach</a>
-          <a href="#contact" className="nav-contact">Get in touch ↗</a>
+          <Link href="/pricing">Pricing</Link>
+          <Link href="/community">Community</Link>
+          <Link href="/learn">My Learning</Link>
+          <Link href="/login">Log in</Link>
+          <Link href="/signup" className="nav-contact">Sign Up ↗</Link>
         </nav>
       </header>
 
@@ -46,6 +67,7 @@ export default function Home() {
           <p className="intro">Build a thoughtful approach to trading. Learn market mechanics, manage risk, and develop a repeatable process—without the hype.</p>
           <div className="actions">
             <Link href="/courses" className="button">Explore courses <span>↗</span></Link>
+            <Link href="/signup" className="button">Sign Up Now <span>↗</span></Link>
             <a href="#path" className="text-link">See the learning path →</a>
           </div>
           <p className="micro">Beginner-friendly · Self-paced learning · English instruction</p>
@@ -132,8 +154,8 @@ export default function Home() {
           </div>
           <label>I’m interested in<select name="interest"><option>Choosing my first course</option><option>Stock markets</option><option>Crypto markets</option><option>Forex markets</option><option>Trading psychology</option><option>Advanced learning</option></select></label>
           <label>Your question<textarea name="message" rows={4} required minLength={10} maxLength={3000} placeholder="How can we help?" /></label>
-          <p className="micro">This opens your email app. Your enquiry is not sent until you send the email.</p>
-          <button className="button" type="submit">Prepare enquiry ↗</button>
+          <button className="button" type="submit" disabled={enquiryBusy}>{enquiryBusy ? "Sending…" : "Send enquiry ↗"}</button>
+          {enquiryStatus && <p role="status" className="micro">{enquiryStatus}</p>}
           {prepared && <p role="status" className="micro">Your email draft is ready. If no app opened, email {process.env.NEXT_PUBLIC_SUPPORT_EMAIL || "hello@technotrade.academy"}.</p>}
         </form>
       </section>

@@ -9,7 +9,7 @@ const supportEmail =
 export default function ContactPage() {
   const [status, setStatus] = useState("");
 
-  function submit(event: FormEvent<HTMLFormElement>) {
+  async function submit(event: FormEvent<HTMLFormElement>) {
     event.preventDefault();
     setStatus("");
     const form = event.currentTarget;
@@ -25,11 +25,20 @@ export default function ContactPage() {
       setStatus("Enter a name of at least 2 characters and a message of at least 20 non-padding characters.");
       return;
     }
-
-    const subject = encodeURIComponent(`${topic} enquiry — ${name}`);
-    const body = encodeURIComponent(`Name: ${name}\nReply email: ${email}\n\n${message}`);
-    window.location.href = `mailto:${supportEmail}?subject=${subject}&body=${body}`;
-    setStatus("Your email app has been requested. Review and send the draft to complete your enquiry. Nothing has been submitted through this website. If no app opens, email us directly.");
+    setStatus("Sending your enquiry…");
+    try {
+      const response = await fetch("/api/enquiries", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ name, email, message: `${topic}: ${message}` }),
+      });
+      const result = await response.json();
+      if (!response.ok) throw new Error(result.error || "Could not send your enquiry.");
+      setStatus("Thanks — your enquiry has been saved. We will reply within two business days.");
+      form.reset();
+    } catch (error) {
+      setStatus(error instanceof Error ? error.message : "Could not send your enquiry.");
+    }
   }
 
   return (
@@ -43,7 +52,7 @@ export default function ContactPage() {
       <div className="grid">
         <section className="card">
           <h2>Send an enquiry</h2>
-          <p>This form prepares an email in your own email app. All fields are required.</p>
+          <p>Your enquiry is saved and the academy team can reply to it. All fields are required.</p>
           <form onSubmit={submit}>
             <label htmlFor="name">Full name</label>
             <input id="name" name="name" autoComplete="name" required minLength={2} maxLength={100} />
@@ -64,7 +73,7 @@ export default function ContactPage() {
               <input type="checkbox" required />
               <span>I agree to share these details by email so the academy can respond to this enquiry.</span>
             </label>
-            <button type="submit">Prepare enquiry email</button>
+            <button type="submit">Send enquiry</button>
             <p role="status" aria-live="polite">{status}</p>
           </form>
         </section>
@@ -75,7 +84,7 @@ export default function ContactPage() {
           <p>Please allow two business days for a response. This is a target, not a guaranteed turnaround; weekends and holidays may take longer.</p>
           <p>For payment questions, include your order reference and payment date—not sensitive banking information.</p>
           <h3>Your information</h3>
-          <p>This page does not store form submissions. Sending the email shares its contents with the support inbox and the email providers involved.</p>
+          <p>Enquiries are stored in the academy database so the team can respond. Never include passwords, card details, or OTPs.</p>
         </aside>
       </div>
       <section className="card faq">

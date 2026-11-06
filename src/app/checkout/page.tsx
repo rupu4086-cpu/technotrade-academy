@@ -1,21 +1,15 @@
-// src/app/checkout/page.tsx
+// Checkout — promo code apply, price breakdown incl. 18% GST, Razorpay
+// button, and an honest "payment setup pending" state when keys are missing.
 "use client";
 
-import Script from "next/script";
-import { useState } from "react";
+import { useEffect, useRef, useState, type FormEvent } from "react";
+import Link from "next/link";
+import { SiteNav, SiteFooter, pageWrap, cardStyle, inputStyle, buttonStyle } from "@/lib/nav";
 
-type PaymentResult = {
-  razorpay_payment_id: string;
-  razorpay_order_id: string;
-  razorpay_signature: string;
-};
-type RazorpayInstance = {
-  open(): void;
-  on(event: "payment.failed", callback: () => void): void;
-};
-// NOTE: this Window.Razorpay declaration must stay identical to the one in
-// src/app/courses/page.tsx — TypeScript requires merged global declarations
-// to have the same type.
+type Course = { id: string; slug: string; title: string; price: number };
+type Breakdown = { pricePaise: number; discountPaise: number; subtotalPaise: number; gstPaise: number; totalPaise: number };
+type PaymentResult = { razorpay_payment_id: string; razorpay_order_id: string; razorpay_signature: string };
+type RazorpayInstance = { open(): void; on(event: "payment.failed", callback: () => void): void };
 type RazorpayConstructor = new (options: {
   key: string; amount: number; currency: string; name: string; description: string;
   order_id: string; prefill?: { email: string }; theme: { color: string };
@@ -23,191 +17,234 @@ type RazorpayConstructor = new (options: {
   modal: { ondismiss: () => void };
 }) => RazorpayInstance;
 
-declare global {
-  interface Window {
-    Razorpay?: RazorpayConstructor;
-  }
-}
+declare global { interface Window { Razorpay?: RazorpayConstructor } }
 
-const key = process.env.NEXT_PUBLIC_RAZORPAY_KEY_ID || "";
-// Enable only after server payment endpoints and final course policies are live.
-const enrolmentOpen = process.env.NEXT_PUBLIC_ENROLMENT_OPEN === "true";
-const amount = 499900;
 const money = (paise: number) =>
   new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR" }).format(paise / 100);
 
+let scriptPromise: Promise<void> | undefined;
+function loadCheckout() {
+  if (window.Razorpay) return Promise.resolve();
+  return (scriptPromise ??= new Promise<void>((resolve, reject) => {
+    const script = document.createElement("script");
+    script.src = "https://checkout.razorpay.com/v1/checkout.js";
+    script.async = true;
+    script.onload = () => (window.Razorpay ? resolve() : reject(new Error("Checkout could not load.")));
+    script.onerror = () => { script.remove(); scriptPromise = undefined; reject(new Error("Unable to load secure checkout.")); };
+    document.head.appendChild(script);
+  }));
+}
+
 export default function CheckoutPage() {
-  const [ready, setReady] = useState(false);
-  const [accepted, setAccepted] = useState(false);
+  const [courses, setCourses] = useState<Course[]>([]);
+  const [courseSlug, setCourseSlug] = useState("");
+  const [razorpayConfigured, setRazorpayConfigured] = useState(true);
+  const [signedIn, setSignedIn] = useState(false);
+  const [email, setEmail] = useState("");
   const [promo, setPromo] = useState("");
+  const [breakdown, setBreakdown] = useState<Breakdown | null>(null);
   const [promoMessage, setPromoMessage] = useState("");
+  const [message, setMessage] = useState("");
   const [busy, setBusy] = useState(false);
   const [paid, setPaid] = useState(false);
-  const [message, setMessage] = useState("");
-  const pending = !key || !enrolmentOpen;
+  const [loading, setLoading] = useState(true);
+  const pending = useRef<PaymentResult | null>(null);
+
+  useEffect(() => {
+    const slug = new URLSearchParams(window.location.search).get("course") || "";
+    setCourseSlug(slug);
+    fetch("/api/checkout")
+      .then((r) => r.json())
+      .then((data) => {
+        setCourses(data.courses || []);
+        setRazorpayConfigured(data.razorpayConfigured !== false);
+        if (data.error) setMessage(data.error);
+      })
+      .catch(() => setMessage("Could not load courses."))
+      .finally(() => setLoading(false));
+    fetch("/api/auth/me").then((r) => r.json()).then((d) => {
+      setSignedIn(Boolean(d.signedIn));
+      if (d.email) setEmail(d.email);
+    }).catch(() => undefined);
+  }, []);
+
+  const course = courses.find((c) => c.slug === courseSlug) || courses[0];
+  useEffect(() => {
+    if (course && !courseSlug) setCourseSlug(course.slug);
+  }, [course, courseSlug]);
+
+  async function quote(event?: FormEvent) {
+    event?.preventDefault();
+    if (!course) return;
+    setPromoMessage("");
+    const response = await fetch("/api/checkout", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ action: "quote", courseId: course.id, promo }),
+    });
+    const data = await response.json();
+    if (!response.ok) {
+      setPromoMessage(data.error || "Promo could not be applied.");
+      setBreakdown(null);
+      return;
+    }
+    setBreakdown(data);
+    setPromoMessage(promo ? "Promo code applied." : "Price updated.");
+  }
 
   async function pay() {
-    if (pending || !ready || !accepted || busy || paid || !window.Razorpay) return;
+    if (!course || busy || paid) return;
+    if (!signedIn) {
+      window.location.href = `/login?next=${encodeURIComponent(`/checkout?course=${course.slug}`)}`;
+      return;
+    }
     setBusy(true);
     setMessage("Creating a secure payment order…");
-
     try {
-      // Server must derive price from courseId, check availability and acceptance,
-      // create a Razorpay order, and persist it against a secure checkout session.
-      const response = await fetch("/api/payments/create-order", {
+      const response = await fetch("/api/checkout", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({
-          courseId: "trading-foundations",
-          policyVersion: "foundations-v1",
-          acceptedPolicies: true,
-        }),
+        body: JSON.stringify({ action: "create", courseId: course.id, promo }),
       });
-      if (response.status === 404 || response.status === 503) {
-        throw new Error("Payment setup is pending. No payment has been initiated.");
+      const data = await response.json();
+      if (!response.ok) throw new Error(data.error || "Could not create an order.");
+      if (data.status === "granted") {
+        setPaid(true);
+        setMessage("Access granted. This course was free (or Rs 0 after promo).");
+        return;
       }
-      if (!response.ok) throw new Error("Could not create an order. Please contact support.");
-      const order = await response.json();
-      if (
-        typeof order.id !== "string" ||
-        !order.id.startsWith("order_") ||
-        order.amount !== amount ||
-        order.currency !== "INR"
-      ) {
-        throw new Error("Order details differ from this summary. Payment stopped; contact support.");
-      }
-
-      const checkout = new window.Razorpay({
-        key,
-        order_id: order.id,
-        amount: order.amount,
-        currency: order.currency,
-        name: "TechnoTrade Academy",
-        description: "Trading Foundations",
-        theme: { color: "#096b56" },
-        modal: {
-          ondismiss: () => {
-            setBusy(false);
-            setMessage("Payment window closed. If your bank shows a debit, contact support before retrying.");
-          },
-        },
+      await loadCheckout();
+      const checkout = new window.Razorpay!({
+        key: data.key, order_id: data.orderId, amount: data.amount, currency: data.currency,
+        name: "TechnoTrade Academy", description: course.title,
+        prefill: { email }, theme: { color: "#0f766e" },
         handler: async (result) => {
           setMessage("Confirming payment securely…");
           try {
-            // Server must verify the signature using its secret, match the
-            // session/order/amount, confirm captured status, and fulfil once.
-            // Use verified webhooks for delayed or interrupted confirmations.
-            const verification = await fetch("/api/payments/verify", {
+            const verification = await fetch("/api/checkout", {
               method: "POST",
               headers: { "Content-Type": "application/json" },
-              body: JSON.stringify(result),
+              body: JSON.stringify({ action: "verify", ...result }),
             });
-            if (!verification.ok) throw new Error();
             const confirmation = await verification.json();
-            if (confirmation.status !== "paid") throw new Error();
-            setPaid(true);
-            setMessage(`Payment confirmed. Order reference: ${result.razorpay_order_id}. Contact support with this reference for access assistance.`);
-          } catch {
-            setMessage(`Payment confirmation is pending. Do not pay again. Contact support with order ${result.razorpay_order_id}.`);
+            if (!verification.ok) throw new Error(confirmation.error || "Verification failed.");
+            if (confirmation.status === "granted") {
+              setPaid(true);
+              setMessage("Payment verified. Course access has been granted to your account.");
+            } else {
+              pending.current = result;
+              setMessage("Payment is not yet captured. Access remains locked — check again, do not pay again.");
+            }
+          } catch (error) {
+            pending.current = result;
+            setMessage(`${error instanceof Error ? error.message : "Verification failed."} If you paid, check the payment again instead of creating another order.`);
           } finally {
             setBusy(false);
           }
         },
+        modal: { ondismiss: () => { setBusy(false); setMessage("Checkout closed. Access is granted only after a captured payment is verified."); } },
       });
-      checkout.on("payment.failed", () => {
-        setBusy(false);
-        setMessage("Payment was not confirmed. Check your bank status before attempting another payment.");
-      });
+      checkout.on("payment.failed", () => { setBusy(false); setMessage("Payment failed. No access has been granted for this attempt."); });
       checkout.open();
-      setMessage("Complete your payment in the secure Razorpay window.");
     } catch (error) {
       setBusy(false);
-      setMessage(error instanceof Error ? error.message : "Payment unavailable. Please contact support.");
+      setMessage(error instanceof Error ? error.message : "Checkout unavailable.");
     }
   }
 
+  async function checkAgain() {
+    const result = pending.current;
+    if (!result) return;
+    setBusy(true);
+    try {
+      const verification = await fetch("/api/checkout", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ action: "verify", ...result }),
+      });
+      const confirmation = await verification.json();
+      if (confirmation.status === "granted") {
+        setPaid(true);
+        pending.current = null;
+        setMessage("Payment verified. Course access has been granted.");
+      } else {
+        setMessage("Payment is still not captured. Wait a moment, then check again — do not pay again.");
+      }
+    } finally {
+      setBusy(false);
+    }
+  }
+
+  const shown = breakdown || (course ? { pricePaise: course.price, discountPaise: 0, subtotalPaise: course.price, gstPaise: Math.round(course.price * 0.18), totalPaise: course.price + Math.round(course.price * 0.18) } : null);
+
   return (
-    <main>
-      {key && enrolmentOpen && (
-        <Script
-          src="https://checkout.razorpay.com/v1/checkout.js"
-          strategy="afterInteractive"
-          onReady={() => setReady(true)}
-          onError={() => setMessage("The payment service could not load. Refresh or contact support.")}
-        />
-      )}
-      <nav aria-label="Main navigation"><a href="/">TechnoTrade Academy</a><a href="/contact">Payment support</a></nav>
-      <header><p className="eyebrow">CHECKOUT</p><h1>A considered investment in learning.</h1><p>Review the course, costs, and policies before paying.</p></header>
-
-      {pending && (
-        <aside className="notice" role="status">
-          <strong>Payment setup pending</strong>
-          <p>Paid enrolment is not available. Payment credentials, secure server processing, and final course policies must be ready before payments are enabled. No money can be collected from this page in this state.</p>
-        </aside>
-      )}
-
-      <div className="grid">
-        <section className="card">
-          <h2>Trading Foundations</h2>
-          <p>A foundational learning programme focused on understanding markets and managing risk.</p>
-          <ul>
-            <li>Market structure, candlesticks, and order types</li>
-            <li>Position sizing and risk planning</li>
-            <li>Paper-trading exercises and journal reviews</li>
-          </ul>
-          <p><strong>Before enrolment:</strong> Confirm instructor details, schedule, delivery format, and access duration with support. These details must be finalised before enrolment opens.</p>
-          <h3>Purchase policies</h3>
-          <p>Review the <a href="/terms" target="_blank" rel="noopener noreferrer">terms of purchase (new tab)</a>, <a href="/refund-policy" target="_blank" rel="noopener noreferrer">refund policy (new tab)</a>, and <a href="/privacy" target="_blank" rel="noopener noreferrer">privacy policy (new tab)</a>. If a policy is unavailable or unclear, do not proceed; contact support.</p>
-          <p>Education only—not personalised investment advice. Trading involves risk of loss. No profits or trading outcomes are guaranteed.</p>
-        </section>
-
-        <section className="card" aria-labelledby="summary-heading">
-          <h2 id="summary-heading">Order summary</h2>
-          <p>One-time payment · INR · No subscription</p>
-          <form onSubmit={(event) => {
-            event.preventDefault();
-            setPromoMessage(promo.trim() ? "No active promo codes are available. No discount has been applied." : "Enter a promo code.");
-          }}>
-            <label htmlFor="promo">Promo code</label>
-            <div className="promo">
-              <input id="promo" value={promo} onChange={(event) => setPromo(event.target.value)} maxLength={40} autoComplete="off" disabled={busy || paid} />
-              <button type="submit" className="secondary" disabled={busy || paid}>Check</button>
-            </div>
-            <p role="status">{promoMessage}</p>
-          </form>
-          <dl>
-            <div><dt>Course price, inclusive of applicable taxes</dt><dd>{money(amount)}</dd></div>
-            <div><dt>Discount</dt><dd>{money(0)}</dd></div>
-            <div><dt>Additional checkout fees</dt><dd>{money(0)}</dd></div>
-            <div className="total"><dt>Total payable</dt><dd>{money(amount)}</dd></div>
-          </dl>
-          <p className="small">No tax is added at checkout. Any applicable tax component will be itemised on the invoice. Your bank may charge its own fees.</p>
-          <label className="accept">
-            <input type="checkbox" checked={accepted} onChange={(event) => setAccepted(event.target.checked)} disabled={busy || paid || pending} />
-            <span>I have read and accept the purchase, refund, and privacy policies, and understand the trading risk disclosure.</span>
-          </label>
-          <button className="pay" onClick={pay} disabled={pending || !ready || !accepted || busy || paid}>
-            {paid ? "Payment confirmed" : pending ? "Payments not yet available" : busy ? "Payment in progress…" : !ready ? "Loading payment service…" : `Pay ${money(amount)} with Razorpay`}
-          </button>
-          <p role="status" aria-live="polite">{message}</p>
-          <p className="small">Payment details are entered in Razorpay’s secure checkout, not in this page.</p>
-        </section>
-      </div>
-      <style>{`
-        *{box-sizing:border-box}body{margin:0;background:#f5f7fb;color:#17253b;font-family:Arial,sans-serif}
-        main{max-width:1080px;margin:auto;padding:24px}nav{display:flex;justify-content:space-between;gap:20px}a{color:#096b56}
-        header{padding:36px 0 20px;max-width:750px}.eyebrow{font-size:12px;letter-spacing:3px}h1{font-size:clamp(32px,5vw,48px)}
-        p,li{line-height:1.7}li{margin-bottom:10px}.grid{display:grid;grid-template-columns:1fr 1fr;gap:24px}
-        .card{padding:26px;background:white;border:1px solid #dae2ec;border-radius:16px}h2{margin-top:0}
-        .notice{padding:20px;background:#fff3d8;border:1px solid #d3a54c;border-radius:12px;margin-bottom:24px}.notice p{margin-bottom:0}
-        label{display:block;font-weight:bold}.promo{display:flex;gap:8px;margin-top:10px}input:not([type=checkbox]){min-width:0;width:100%;padding:12px;border:1px solid #8494aa;border-radius:8px;font:inherit}
-        button{padding:12px 16px;border:0;border-radius:8px;font:inherit;cursor:pointer;background:#096b56;color:white}
-        .secondary{background:#e8eef5;color:#17253b}button:disabled{opacity:.6;cursor:not-allowed}
-        dl>div{display:flex;justify-content:space-between;gap:20px;padding:14px 0;border-bottom:1px solid #dae2ec}
-        dd{margin:0;white-space:nowrap}.total{font-weight:bold;font-size:20px}.small{font-size:13px;color:#526174}
-        .accept{display:flex;gap:10px;font-weight:normal;font-size:14px;line-height:1.6;margin:24px 0}.accept input{align-self:flex-start;margin-top:5px}
-        .pay{width:100%}:focus-visible{outline:3px solid #c48a25;outline-offset:3px}@media(max-width:760px){.grid{grid-template-columns:1fr}}
-      `}</style>
-    </main>
+    <>
+      <SiteNav />
+      <main style={pageWrap}>
+        <p style={{ letterSpacing: 3, fontSize: 12, fontWeight: 700, color: "#0f766e" }}>CHECKOUT</p>
+        <h1 style={{ fontSize: 36, margin: "12px 0" }}>Secure checkout</h1>
+        {!razorpayConfigured && (
+          <p style={{ ...cardStyle, background: "#fef3c7" }}>
+            <strong>Payment setup pending.</strong> Razorpay keys are not configured yet, so paid
+            checkout is not available. Free courses still unlock instantly. No payment has been started.
+          </p>
+        )}
+        {loading ? <p>Loading courses…</p> : !courses.length ? (
+          <p style={cardStyle}>Courses coming soon. No published courses are available to buy yet.</p>
+        ) : (
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 360px", gap: 20 }}>
+            <section style={cardStyle}>
+              <label style={{ display: "block", marginBottom: 16 }}>
+                Course
+                <select style={inputStyle} value={course?.slug || ""} onChange={(e) => { setCourseSlug(e.target.value); setBreakdown(null); setPromoMessage(""); }}>
+                  {courses.map((c) => <option key={c.id} value={c.slug}>{c.title} — {money(c.price)}</option>)}
+                </select>
+              </label>
+              <form onSubmit={quote}>
+                <label style={{ display: "block", marginBottom: 16 }}>
+                  Promo code (optional)
+                  <input style={inputStyle} value={promo} onChange={(e) => setPromo(e.target.value.toUpperCase())} maxLength={40} placeholder="e.g. WELCOME10" />
+                </label>
+                <button type="submit" style={{ ...buttonStyle, background: "#17253b" }}>Apply promo</button>
+              </form>
+              {promoMessage && <p role="status">{promoMessage}</p>}
+              {!signedIn && (
+                <p>
+                  Please <Link href={`/login?next=${encodeURIComponent(`/checkout?course=${course?.slug || ""}`)}`}>log in</Link> or{" "}
+                  <Link href="/signup">sign up</Link> before paying, so the course is linked to your account.
+                </p>
+              )}
+              <p style={{ fontSize: 13, color: "#526174", lineHeight: 1.7 }}>
+                Access is granted only after a verified captured Razorpay payment. Never pay twice for
+                the same order — use “Check payment again” if verification is interrupted.
+              </p>
+            </section>
+            <aside style={cardStyle}>
+              <h2 style={{ marginTop: 0 }}>Price breakdown</h2>
+              {shown && course && (
+                <div style={{ lineHeight: 2.2 }}>
+                  <p style={{ display: "flex", justifyContent: "space-between", margin: 0 }}><span>Course price</span><strong>{money(shown.pricePaise)}</strong></p>
+                  <p style={{ display: "flex", justifyContent: "space-between", margin: 0 }}><span>Promo discount</span><strong>− {money(shown.discountPaise)}</strong></p>
+                  <p style={{ display: "flex", justifyContent: "space-between", margin: 0 }}><span>Subtotal</span><strong>{money(shown.subtotalPaise)}</strong></p>
+                  <p style={{ display: "flex", justifyContent: "space-between", margin: 0 }}><span>GST (18%)</span><strong>{money(shown.gstPaise)}</strong></p>
+                  <hr />
+                  <p style={{ display: "flex", justifyContent: "space-between", margin: 0, fontSize: 20 }}><span>Total</span><strong>{money(shown.totalPaise)}</strong></p>
+                </div>
+              )}
+              <button onClick={() => void pay()} disabled={busy || paid || !course || !razorpayConfigured} style={{ ...buttonStyle, width: "100%", marginTop: 16 }}>
+                {paid ? "Access granted ✓" : busy ? "Please wait…" : !razorpayConfigured ? "Payment setup pending" : "Pay securely with Razorpay →"}
+              </button>
+              {pending.current && !paid && (
+                <button onClick={() => void checkAgain()} disabled={busy} style={{ ...buttonStyle, width: "100%", marginTop: 12, background: "#17253b" }}>
+                  Check payment again
+                </button>
+              )}
+              {message && <p role="status">{message}</p>}
+            </aside>
+          </div>
+        )}
+      </main>
+      <SiteFooter />
+    </>
   );
 }

@@ -1,264 +1,141 @@
-// src/app/learn/page.tsx
+// My Learning — progress, lesson player (YouTube embed), free previews open
+// to all, paid lessons locked until the student is enrolled (which only
+// happens after a verified captured payment, or a free / Rs 0 checkout).
 import Link from "next/link";
-import Script from "next/script";
-import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
-import { revalidatePath } from "next/cache";
-import { createDecipheriv, createHash, createHmac, timingSafeEqual } from "node:crypto";
+import { getSession } from "@/lib/auth";
+import {
+  sb, listPublishedCourses, listLessons, youtubeId, money, type DbLesson,
+} from "@/lib/supabase";
+import { SiteNav, SiteFooter, pageWrap, cardStyle } from "@/lib/nav";
+import { MarkCompleteButton } from "./mark-complete";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-type Session = { sub: string; email: string; role: string; exp: number };
-type Lesson = { id: string; title: string; minutes: number; videoId?: string; status?: string };
-type Course = { id: string; title: string; thumbnail?: string; lessons: Lesson[] };
-type Enrollment = { userId: string; courseId: string; status: string; completed: string[]; orderId?: string };
-type Order = {
-  id: string; userId: string; courseId: string; amount: number; currency: string;
-  linkId: string; status: string; createdAt: string;
-};
-
-import { getRecord as get, allRecords as all, putRecord as put } from "@/lib/store";
-
-async function requireUser(): Promise<Session> {
-  const secret = process.env.SESSION_SECRET;
-  const token = (await cookies()).get("academy_session")?.value;
-  if (secret && token) {
-    const [payload, signature, extra] = token.split(".");
-    if (payload && signature && !extra) {
-      const expected = createHmac("sha256", secret).update(payload).digest();
-      const actual = Buffer.from(signature, "base64url");
-      if (actual.length === expected.length && timingSafeEqual(actual, expected)) {
-        try {
-          const user = JSON.parse(Buffer.from(payload, "base64url").toString()) as Session;
-          if (typeof user.sub === "string" && user.sub && typeof user.email === "string" && user.exp > Date.now() / 1000) return user;
-        } catch {}
-      }
-    }
-  }
-  redirect("/login?next=%2Flearn");
-}
-
-function decrypt(value: string) {
-  const secret = process.env.SETTINGS_ENCRYPTION_KEY;
-  if (!secret) throw new Error("Payment settings unavailable");
-  const [iv, tag, ciphertext] = value.split(".");
-  const decipher = createDecipheriv("aes-256-gcm", createHash("sha256").update(secret).digest(), Buffer.from(iv, "base64url"));
-  decipher.setAuthTag(Buffer.from(tag, "base64url"));
-  return Buffer.concat([decipher.update(Buffer.from(ciphertext, "base64url")), decipher.final()]).toString();
-}
-
-async function verifyPurchases(user: Session) {
-  const pending = (await all<Order>("order:")).filter(o => o.userId === user.sub && o.status === "pending");
-  if (!pending.length) return false;
-  const settings = await get<{ keyId?: string; keySecret?: string }>("settings") || {};
-  let failed = false;
-  try {
-    const id = settings.keyId || process.env.RAZORPAY_KEY_ID;
-    const secret = settings.keySecret ? decrypt(settings.keySecret) : process.env.RAZORPAY_KEY_SECRET;
-    if (!id || !secret) return true;
-    await Promise.all(pending.slice(-20).map(async order => {
-      try {
-        const response = await fetch(`https://api.razorpay.com/v1/payment_links/${encodeURIComponent(order.linkId)}`, {
-          cache: "no-store", signal: AbortSignal.timeout(10000),
-          headers: { Authorization: `Basic ${Buffer.from(`${id}:${secret}`).toString("base64")}` },
-        });
-        if (!response.ok) throw new Error("Verification failed");
-        const link = await response.json();
-        if (link.status === "paid" && link.reference_id === order.id &&
-            link.amount === order.amount && link.amount_paid === order.amount && link.currency === order.currency) {
-          // Never trust callback query parameters as proof of payment.
-          try {
-            const current = await get<Order>(`order:${order.id}`);
-            if (current?.status === "pending") {
-              await put(`order:${order.id}`, { ...current, status: "paid" });
-              const key = `enrollment:${user.sub}:${order.courseId}`;
-              const existing = await get<Enrollment>(key);
-              await put(key, {
-                userId: user.sub, courseId: order.courseId, status: "active",
-                completed: existing?.completed || [], orderId: order.id,
-              } satisfies Enrollment);
-            }
-          } catch (error) { throw error; }
-        } else if (["expired", "cancelled"].includes(link.status)) {
-          const current = await get<Order>(`order:${order.id}`);
-          if (current?.status === "pending") await put(`order:${order.id}`, { ...current, status: link.status });
-        }
-      } catch { failed = true; }
-    }));
-  } catch { failed = true; }
-  return failed;
-}
-
-async function completeLesson(form: FormData) {
-  "use server";
-  const user = await requireUser();
-  const courseId = String(form.get("courseId") || "");
-  const lessonId = String(form.get("lessonId") || "");
-  const course = await get<Course>(`course:${courseId}`);
-  const key = `enrollment:${user.sub}:${courseId}`;
-  try {
-    const enrollment = await get<Enrollment>(key);
-    if (enrollment?.status !== "active" || !course?.lessons.some(l => l.id === lessonId)) throw new Error("Access denied");
-    await put(key, { ...enrollment, completed: [...new Set([...enrollment.completed, lessonId])] });
-  } catch (error) { throw error; }
-  revalidatePath("/learn");
-  const index = course!.lessons.findIndex(l => l.id === lessonId);
-  const next = course!.lessons[index + 1] || course!.lessons[index];
-  redirect(`/learn?course=${encodeURIComponent(courseId)}&lesson=${encodeURIComponent(next.id)}`);
-}
-
-async function playbackToken(videoId: string) {
-  const account = process.env.CLOUDFLARE_ACCOUNT_ID;
-  const apiToken = process.env.CLOUDFLARE_STREAM_API_TOKEN;
-  if (!account || !apiToken || !/^[a-f0-9]{32}$/i.test(videoId)) return null;
-  try {
-    const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(account)}/stream/${videoId}/token`, {
-      method: "POST", cache: "no-store", signal: AbortSignal.timeout(10000),
-      headers: { Authorization: `Bearer ${apiToken}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 14400 }),
-    });
-    const data = await response.json();
-    return response.ok && data.success ? data.result.token as string : null;
-  } catch { return null; }
-}
-
 export default async function MyLearning({
   searchParams,
 }: { searchParams: Promise<{ course?: string; lesson?: string }> }) {
-  const user = await requireUser();
-  const verificationFailed = await verifyPurchases(user);
+  const session = await getSession();
+  if (!session) redirect("/login?next=%2Flearn");
   const query = await searchParams;
-  const enrollments = (await all<Enrollment>("enrollment:")).filter(e => e.userId === user.sub);
-  const active = enrollments.filter(e => e.status === "active");
-  const courses = (await Promise.all(active.map(async (e) => ({ enrollment: e, course: await get<Course>(`course:${e.courseId}`) }))))
-    .filter((x): x is { enrollment: Enrollment; course: Course } => Boolean(x.course));
-  const selected = courses.find(x => x.course.id === query.course) || courses[0];
-  const course = selected?.course;
-  const enrollment = selected?.enrollment;
-  const lesson = course?.lessons.find(l => l.id === query.lesson) ||
-    course?.lessons.find(l => !enrollment?.completed.includes(l.id)) || course?.lessons[0];
-  const token = lesson?.videoId && lesson.status === "ready" ? await playbackToken(lesson.videoId) : null;
-  const resumeKey = lesson ? `academy:${user.sub}:${course!.id}:${lesson.id}` : "";
-  const percent = (c: Course, e: Enrollment) => c.lessons.length
-    ? Math.round(c.lessons.filter(l => e.completed.includes(l.id)).length / c.lessons.length * 100) : 0;
-  const hasPending = (await all<Order>("order:")).some(o => o.userId === user.sub && o.status === "pending");
-  const inactiveTitles = new Map<string, string>();
-  for (const e of enrollments.filter((x) => x.status !== "active")) {
-    const inactiveCourse = await get<Course>(`course:${e.courseId}`);
-    inactiveTitles.set(e.courseId, inactiveCourse?.title || "Course");
+
+  let courses: { id: string; slug: string; title: string; description: string }[] = [];
+  let enrollments: { course_id: string }[] = [];
+  let loadError = "";
+  try {
+    courses = await listPublishedCourses();
+    enrollments = await sb<{ course_id: string }[]>(
+      `enrollments?select=course_id&user_id=eq.${session.sub}`,
+    );
+  } catch (error) {
+    loadError = error instanceof Error ? error.message : "Your courses could not be loaded.";
   }
+  const enrolledIds = new Set(enrollments.map((e) => e.course_id));
+  const selectedCourse = courses.find((c) => c.id === query.course || c.slug === query.course) || courses.find((c) => enrolledIds.has(c.id));
+
+  let lessons: DbLesson[] = [];
+  let completed: string[] = [];
+  if (selectedCourse) {
+    try {
+      lessons = await listLessons(selectedCourse.id);
+      const progress = await sb<{ lesson_id: string }[]>(
+        `lesson_progress?select=lesson_id&user_id=eq.${session.sub}&completed=eq.true`,
+      );
+      completed = progress.map((p) => p.lesson_id);
+    } catch { /* lessons stay empty; error shown below */ }
+  }
+  const isEnrolled = selectedCourse ? enrolledIds.has(selectedCourse.id) : false;
+  const selectedLesson =
+    lessons.find((l) => l.id === query.lesson) ||
+    lessons.find((l) => !completed.includes(l.id)) ||
+    lessons[0];
+  const canWatch = selectedLesson ? selectedLesson.is_free_preview || isEnrolled : false;
+  const percent = lessons.length
+    ? Math.round((lessons.filter((l) => completed.includes(l.id)).length / lessons.length) * 100)
+    : 0;
 
   return (
-    <main style={{ maxWidth: 1100, margin: "auto", padding: 24 }}>
-      <nav><Link href="/">TechnoTrade Academy</Link></nav>
-      <h1>My Learning</h1>
-      {(verificationFailed || hasPending) && (
-        <p role="status">
-          {verificationFailed ? "Payment verification is temporarily unavailable." : "An unfinished or recently paid checkout is awaiting confirmation."}
-          {" "}<a href="/learn">Check payment status again</a>
+    <>
+      <SiteNav />
+      <main style={pageWrap}>
+        <h1 style={{ fontSize: 34 }}>My Learning</h1>
+        <p style={{ color: "#526174" }}>Welcome back, {session.name}. Your progress is saved to your account.</p>
+        {loadError && <p role="status">{loadError}</p>}
+        {!courses.length && !loadError && (
+          <p style={cardStyle}>No courses are published yet. <Link href="/courses">Check the catalog</Link> — it will show “Courses coming soon” until the owner adds courses.</p>
+        )}
+        <div style={{ display: "grid", gridTemplateColumns: "280px 1fr", gap: 20 }}>
+          <section style={cardStyle}>
+            <h2 style={{ marginTop: 0 }}>Your courses</h2>
+            {courses.filter((c) => enrolledIds.has(c.id)).map((c) => (
+              <p key={c.id}>
+                <Link href={`/learn?course=${c.slug}`}>{c.title}</Link>
+              </p>
+            ))}
+            {!courses.some((c) => enrolledIds.has(c.id)) && <p>No enrolled courses yet. <Link href="/courses">Browse courses</Link></p>}
+            <h3>All courses</h3>
+            {courses.map((c) => (
+              <p key={c.id}>
+                <Link href={`/courses/${c.slug}`}>{c.title}</Link>
+                {enrolledIds.has(c.id) ? " · Enrolled" : " · Not enrolled"}
+              </p>
+            ))}
+          </section>
+
+          {selectedCourse && (
+            <section style={cardStyle}>
+              <h2 style={{ marginTop: 0 }}>{selectedCourse.title}</h2>
+              <p>{percent}% complete</p>
+              <progress max={100} value={percent} style={{ width: "100%" }} aria-label={`${selectedCourse.title} progress`} />
+              {selectedLesson && (
+                <>
+                  <h3>{selectedLesson.title}</h3>
+                  {canWatch ? (
+                    youtubeId(selectedLesson.video_url) ? (
+                      <iframe
+                        title={selectedLesson.title}
+                        src={`https://www.youtube-nocookie.com/embed/${youtubeId(selectedLesson.video_url)}`}
+                        allow="accelerometer; autoplay; encrypted-media; picture-in-picture"
+                        allowFullScreen
+                        style={{ width: "100%", aspectRatio: "16 / 9", border: 0 }}
+                      />
+                    ) : (
+                      <p>This lesson has no video link yet.</p>
+                    )
+                  ) : (
+                    <p style={{ background: "#fef3c7", padding: 16, borderRadius: 8 }}>
+                      This lesson is locked. {selectedLesson.is_free_preview ? "" : "Free preview lessons are open to everyone — this one is not a preview. "}
+                      <Link href={`/checkout?course=${selectedCourse.slug}`}>Buy this course</Link> to unlock it. Access is granted only after a verified payment.
+                    </p>
+                  )}
+                  {isEnrolled && selectedLesson && (
+                    <div style={{ marginTop: 12 }}>
+                      <MarkCompleteButton courseId={selectedCourse.id} lessonId={selectedLesson.id} done={completed.includes(selectedLesson.id)} />
+                    </div>
+                  )}
+                  <h3>Curriculum</h3>
+                  <ol style={{ lineHeight: 2 }}>
+                    {lessons.map((lesson) => (
+                      <li key={lesson.id}>
+                        <Link href={`/learn?course=${selectedCourse.slug}&lesson=${lesson.id}`}>{lesson.title}</Link>
+                        {lesson.is_free_preview ? " · Free preview" : ""}
+                        {completed.includes(lesson.id) ? " · Completed" : ""}
+                        {!lesson.is_free_preview && !isEnrolled ? " · Locked" : ""}
+                      </li>
+                    ))}
+                  </ol>
+                </>
+              )}
+              {!selectedLesson && <p>No lessons in this course yet.</p>}
+            </section>
+          )}
+        </div>
+        <p style={{ marginTop: 20, color: "#526174", fontSize: 13 }}>
+          Prices are shown in INR. Paid lessons unlock only after a verified captured Razorpay payment.
         </p>
-      )}
-      {!courses.length && <p>No active courses yet. <Link href="/">Explore courses</Link></p>}
-      <section aria-labelledby="purchased">
-        <h2 id="purchased">Your courses</h2>
-        <ul>
-          {courses.map(({ course: c, enrollment: e }) => (
-            <li key={c.id} style={{ marginBottom: 16 }}>
-              <Link href={`/learn?course=${encodeURIComponent(c.id)}`}>{c.title}</Link>
-              <div><progress max={100} value={percent(c, e)} aria-label={`${c.title} progress`} /> {percent(c, e)}% complete</div>
-            </li>
-          ))}
-        </ul>
-        {enrollments.filter(e => e.status !== "active").map(e => (
-          <p key={e.courseId}>{inactiveTitles.get(e.courseId) || "Course"} — Access inactive ({e.status.replaceAll("_", " ")})</p>
-        ))}
-      </section>
-      {course && lesson && enrollment && (
-        <section aria-labelledby="current-course">
-          <h2 id="current-course">{course.title}</h2>
-          <h3>{lesson.title}</h3>
-          {token ? (
-            <>
-              <iframe
-                key={`${lesson.id}:${token}`}
-                id="lesson-player"
-                title={lesson.title}
-                src={`https://iframe.videodelivery.net/${token}`}
-                data-resume-key={resumeKey}
-                allow="accelerometer; gyroscope; autoplay; encrypted-media; picture-in-picture"
-                allowFullScreen
-                style={{ width: "100%", aspectRatio: "16 / 9", border: 0 }}
-              />
-              <p id="resume-status" role="status">Playback position is saved on this browser. Completed lessons sync to your account.</p>
-              <Script id={`resume-${lesson.id}-${token.slice(-12)}`} strategy="afterInteractive">{`
-                (() => {
-                  const frame = document.getElementById("lesson-player");
-                  if (!frame || frame.dataset.bound) return;
-                  const initialize = () => {
-                    if (!window.Stream || !frame.isConnected || frame.dataset.bound) return;
-                    frame.dataset.bound = "true";
-                    const player = window.Stream(frame);
-                    const key = frame.dataset.resumeKey;
-                    let lastSaved = 0;
-                    player.addEventListener("loadedmetadata", () => {
-                      try {
-                        const seconds = Number(localStorage.getItem(key) || 0);
-                        if (Number.isFinite(seconds) && seconds > 0 && seconds < player.duration - 5) {
-                          player.currentTime = seconds;
-                          const status = document.getElementById("resume-status");
-                          if (status) status.textContent = "Resumed at " + Math.floor(seconds / 60) + ":" + String(Math.floor(seconds % 60)).padStart(2, "0") + ". Position is saved on this browser.";
-                        }
-                      } catch {}
-                    });
-                    const save = () => {
-                      try { localStorage.setItem(key, String(player.currentTime || 0)); } catch {}
-                    };
-                    player.addEventListener("timeupdate", () => {
-                      if (Date.now() - lastSaved > 5000) { save(); lastSaved = Date.now(); }
-                    });
-                    player.addEventListener("pause", save);
-                    player.addEventListener("ended", () => {
-                      try { localStorage.removeItem(key); } catch {}
-                      const status = document.getElementById("resume-status");
-                      if (status) status.textContent = "Lesson finished. Mark it complete to update your progress.";
-                    });
-                  };
-                  if (window.Stream) initialize();
-                  else {
-                    const script = document.createElement("script");
-                    script.src = "https://embed.cloudflarestream.com/embed/sdk.latest.js";
-                    script.onload = initialize;
-                    script.onerror = () => {
-                      const status = document.getElementById("resume-status");
-                      if (status) status.textContent = "Automatic resume is unavailable. You can still use the player.";
-                    };
-                    document.head.appendChild(script);
-                  }
-                })();
-              `}</Script>
-            </>
-          ) : <p role="status">This lesson video is processing or temporarily unavailable. Please try again later.</p>}
-          <form action={completeLesson}>
-            <input type="hidden" name="courseId" value={course.id} />
-            <input type="hidden" name="lessonId" value={lesson.id} />
-            <button type="submit">{enrollment.completed.includes(lesson.id) ? "Continue to next lesson" : "Mark complete and continue"}</button>
-          </form>
-          <nav aria-label="Course curriculum">
-            <h3>Curriculum</h3>
-            <ol>
-              {course.lessons.map(l => (
-                <li key={l.id}>
-                  <Link aria-current={lesson.id === l.id ? "page" : undefined} href={`/learn?course=${encodeURIComponent(course.id)}&lesson=${encodeURIComponent(l.id)}`}>
-                    {l.title}
-                  </Link>
-                  {" "}— {l.minutes} min{enrollment.completed.includes(l.id) ? " · Completed" : ""}
-                </li>
-              ))}
-            </ol>
-          </nav>
-        </section>
-      )}
-    </main>
+      </main>
+      <SiteFooter />
+    </>
   );
 }

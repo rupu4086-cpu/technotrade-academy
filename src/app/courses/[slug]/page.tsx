@@ -1,200 +1,116 @@
-// src/app/courses/[slug]/page.tsx
+// Course Detail — curriculum, free preview, Buy Now. Reads the published
+// course, its modules and lessons from Supabase.
 import Link from "next/link";
-import { cookies } from "next/headers";
-import { notFound, redirect } from "next/navigation";
-import { createDecipheriv, createHash, createHmac, timingSafeEqual, randomUUID } from "node:crypto";
+import { notFound } from "next/navigation";
+import { getSession } from "@/lib/auth";
+import {
+  getCourseBySlug, listModules, listLessons, sb, money, youtubeId,
+} from "@/lib/supabase";
+import { SiteNav, SiteFooter, pageWrap, cardStyle } from "@/lib/nav";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 
-type Lesson = { id: string; title: string; minutes: number; videoId?: string; status?: string };
-type Course = {
-  id: string; slug: string; title: string; description: string; published: boolean;
-  thumbnail?: string; price: number; prerequisites: string[]; outcomes: string[];
-  instructor: { name: string; bio: string }; refundTerms: string;
-  lessons: Lesson[]; previewLessonId?: string;
-};
-type Session = { sub: string; email: string; role: string; exp: number };
-type Promo = { code: string; percent: number; active: boolean; expires?: string; courseId?: string };
-type Enrollment = { status: string };
-type Order = {
-  id: string; userId: string; courseId: string; amount: number; currency: string;
-  linkId: string; url: string; status: string; promo?: string; refundTerms: string; createdAt: string;
-};
-
-import { getRecord as get, allRecords as all, putRecord as put } from "@/lib/store";
-
-// Authentication must issue academy_session as an HttpOnly, Secure, SameSite=Lax
-// cookie: base64url(JSON session) + "." + base64url(HMAC-SHA256(payload)).
-async function session(): Promise<Session | null> {
-  const secret = process.env.SESSION_SECRET;
-  const token = (await cookies()).get("academy_session")?.value;
-  if (!secret || !token) return null;
-  const [payload, signature, extra] = token.split(".");
-  if (!payload || !signature || extra) return null;
-  const expected = createHmac("sha256", secret).update(payload).digest();
-  const actual = Buffer.from(signature, "base64url");
-  if (actual.length !== expected.length || !timingSafeEqual(actual, expected)) return null;
-  try {
-    const value = JSON.parse(Buffer.from(payload, "base64url").toString()) as Session;
-    return typeof value.sub === "string" && value.sub.length > 0 &&
-      typeof value.email === "string" && value.exp > Date.now() / 1000 ? value : null;
-  } catch { return null; }
-}
-
-function decrypt(value?: string) {
-  if (!value) return "";
-  const secret = process.env.SETTINGS_ENCRYPTION_KEY;
-  if (!secret) throw new Error("Payment settings are unavailable.");
-  const [iv, tag, ciphertext] = value.split(".");
-  const decipher = createDecipheriv("aes-256-gcm", createHash("sha256").update(secret).digest(), Buffer.from(iv, "base64url"));
-  decipher.setAuthTag(Buffer.from(tag, "base64url"));
-  return Buffer.concat([decipher.update(Buffer.from(ciphertext, "base64url")), decipher.final()]).toString();
-}
-
-async function paymentLink(body: unknown) {
-  const settings = await get<{ keyId?: string; keySecret?: string }>("settings") || {};
-  const id = settings.keyId || process.env.RAZORPAY_KEY_ID;
-  const secret = settings.keySecret ? decrypt(settings.keySecret) : process.env.RAZORPAY_KEY_SECRET;
-  if (!id || !secret) throw new Error("Checkout is not configured.");
-  const response = await fetch("https://api.razorpay.com/v1/payment_links", {
-    method: "POST", cache: "no-store", signal: AbortSignal.timeout(20000),
-    headers: { Authorization: `Basic ${Buffer.from(`${id}:${secret}`).toString("base64")}`, "Content-Type": "application/json" },
-    body: JSON.stringify(body),
-  });
-  if (!response.ok) throw new Error("Checkout is temporarily unavailable.");
-  return response.json() as Promise<{ id: string; short_url: string }>;
-}
-
-async function previewToken(videoId: string) {
-  const account = process.env.CLOUDFLARE_ACCOUNT_ID;
-  const token = process.env.CLOUDFLARE_STREAM_API_TOKEN;
-  if (!account || !token || !/^[a-f0-9]{32}$/i.test(videoId)) return null;
-  try {
-    const response = await fetch(`https://api.cloudflare.com/client/v4/accounts/${encodeURIComponent(account)}/stream/${videoId}/token`, {
-      method: "POST", cache: "no-store", signal: AbortSignal.timeout(10000),
-      headers: { Authorization: `Bearer ${token}`, "Content-Type": "application/json" },
-      body: JSON.stringify({ exp: Math.floor(Date.now() / 1000) + 3600 }),
-    });
-    const data = await response.json();
-    return response.ok && data.success ? data.result.token as string : null;
-  } catch { return null; }
-}
-
-async function buy(form: FormData) {
-  "use server";
-  const user = await session();
-  if (!user) redirect("/login?next=%2Flearn");
-  const course = await get<Course>(`course:${String(form.get("courseId") || "")}`);
-  if (!course?.published) notFound();
-  const back = `/courses/${encodeURIComponent(course.slug)}`;
-  if ((await get<Enrollment>(`enrollment:${user.sub}:${course.id}`))?.status === "active")
-    redirect(`/learn?course=${encodeURIComponent(course.id)}`);
-  if (form.get("terms") !== "on") redirect(`${back}?error=terms`);
-
-  const code = String(form.get("promo") || "").trim().toUpperCase();
-  const promo = code ? await get<Promo>(`promo:${code}`) : undefined;
-  if (code && (!promo?.active || (promo.courseId && promo.courseId !== course.id) ||
-      (promo.expires && Date.parse(promo.expires) <= Date.now())))
-    redirect(`${back}?error=promo`);
-
-  const amount = Math.round(course.price * (1 - (promo?.percent || 0) / 100));
-  if (!Number.isSafeInteger(amount) || amount < 100) redirect(`${back}?error=price`);
-
-  // Reuse an outstanding checkout to reduce accidental duplicate payments.
-  const pending = (await all<Order>("order:")).find(order =>
-    order.userId === user.sub && order.courseId === course.id &&
-    order.status === "pending" && order.amount === amount && order.promo === code &&
-    Date.now() - Date.parse(order.createdAt) < 25 * 60 * 1000);
-  if (pending) redirect(pending.url);
-
-  let url = "";
-  try {
-    const origin = new URL(process.env.APP_URL || "");
-    if (origin.protocol !== "https:" && origin.hostname !== "localhost") throw new Error("Invalid application URL");
-    const id = randomUUID();
-    const link = await paymentLink({
-      amount, currency: "INR", accept_partial: false, reference_id: id,
-      description: course.title.slice(0, 200),
-      customer: { email: user.email },
-      notify: { email: false, sms: false }, reminder_enable: false,
-      expire_by: Math.floor(Date.now() / 1000) + 1800,
-      callback_url: new URL("/learn", origin).toString(), callback_method: "get",
-      notes: { userId: user.sub, courseId: course.id, promo: code },
-    });
-    if (!link.id || new URL(link.short_url).protocol !== "https:") throw new Error("Invalid checkout");
-    await put(`order:${id}`, {
-      id, userId: user.sub, courseId: course.id, amount, currency: "INR",
-      linkId: link.id, url: link.short_url, status: "pending", promo: code,
-      refundTerms: course.refundTerms, createdAt: new Date().toISOString(),
-    } satisfies Order);
-    url = link.short_url;
-  } catch { redirect(`${back}?error=checkout`); }
-  redirect(url);
-}
-
-export default async function CourseDetail({
-  params, searchParams,
-}: {
-  params: Promise<{ slug: string }>;
-  searchParams: Promise<{ error?: string }>;
-}) {
+export default async function CourseDetail({ params }: { params: Promise<{ slug: string }> }) {
   const { slug } = await params;
-  const { error } = await searchParams;
-  const course = (await all<Course>("course:")).find(c => c.slug === slug && c.published);
-  if (!course) notFound();
-  const user = await session();
-  const owned = user && (await get<Enrollment>(`enrollment:${user.sub}:${course.id}`))?.status === "active";
-  const preview = course.lessons.find(l => l.id === course.previewLessonId && l.status === "ready");
-  const token = preview?.videoId ? await previewToken(preview.videoId) : null;
-  const errors: Record<string, string> = {
-    promo: "This promo code is invalid, expired, or not applicable.",
-    terms: "Please accept the refund terms before continuing.",
-    checkout: "Checkout is unavailable. Please try again shortly.",
-    price: "This price cannot be processed. Please contact support.",
-  };
+  let course: Awaited<ReturnType<typeof getCourseBySlug>> = null;
+  let loadError = "";
+  try {
+    course = await getCourseBySlug(slug);
+  } catch (error) {
+    loadError = error instanceof Error ? error.message : "Course could not be loaded.";
+  }
+  if (!course) {
+    if (loadError) {
+      return (
+        <>
+          <SiteNav />
+          <main style={pageWrap}><p role="status">{loadError}</p><p><Link href="/courses">Back to courses</Link></p></main>
+          <SiteFooter />
+        </>
+      );
+    }
+    notFound();
+  }
+  const session = await getSession();
+  const [modules, lessons] = await Promise.all([
+    listModules(course.id).catch(() => []),
+    listLessons(course.id).catch(() => []),
+  ]).catch(() => [[], []] as const);
+  const enrolled = session
+    ? (await sb<{ id: string }[]>(`enrollments?select=id&user_id=eq.${session.sub}&course_id=eq.${course.id}`).catch(() => [])).length > 0
+    : false;
+  const preview = lessons.find((l) => l.is_free_preview);
+
   return (
-    <main style={{ maxWidth: 1040, margin: "auto", padding: 24 }}>
-      <nav aria-label="Main navigation"><Link href="/">TechnoTrade Academy</Link> · <Link href="/learn">My Learning</Link></nav>
-      <header>
-        <h1>{course.title}</h1>
-        <p>{course.description}</p>
-        {course.thumbnail && <img src={course.thumbnail} alt="" width={640} style={{ maxWidth: "100%", height: "auto" }} />}
-        <p>{course.lessons.length} lessons · {course.lessons.reduce((n, l) => n + l.minutes, 0)} minutes</p>
-      </header>
-      <section aria-labelledby="outcomes">
-        <h2 id="outcomes">What you will learn</h2>
-        <ul>{course.outcomes.map((text, i) => <li key={i}>{text}</li>)}</ul>
-      </section>
-      <section aria-labelledby="prerequisites">
-        <h2 id="prerequisites">Prerequisites</h2>
-        {course.prerequisites.length ? <ul>{course.prerequisites.map((text, i) => <li key={i}>{text}</li>)}</ul> : <p>No prerequisites specified.</p>}
-      </section>
-      <section aria-labelledby="curriculum">
-        <h2 id="curriculum">Curriculum</h2>
-        <ol>{course.lessons.map(l => <li key={l.id}>{l.title} — {l.minutes} min{l.id === course.previewLessonId ? " · Free preview" : ""}</li>)}</ol>
-      </section>
-      <section aria-labelledby="preview">
-        <h2 id="preview">Preview lesson</h2>
-        {token ? <iframe title={`Preview: ${preview!.title}`} src={`https://iframe.videodelivery.net/${token}`} allow="accelerometer; gyroscope; autoplay; encrypted-media; picture-in-picture" allowFullScreen style={{ width: "100%", aspectRatio: "16 / 9", border: 0 }} /> : <p>A preview is not currently available.</p>}
-      </section>
-      <section><h2>Your instructor</h2><h3>{course.instructor.name}</h3><p>{course.instructor.bio}</p></section>
-      <section aria-labelledby="pricing">
-        <h2 id="pricing">Course access</h2>
-        <p><strong>{new Intl.NumberFormat("en-IN", { style: "currency", currency: "INR" }).format(course.price / 100)}</strong> · One-time payment</p>
-        <h3>Refund terms</h3><p style={{ whiteSpace: "pre-wrap" }}>{course.refundTerms}</p>
-        {error && <p role="alert">{errors[error] || "Please try again."}</p>}
-        {owned ? <Link href={`/learn?course=${encodeURIComponent(course.id)}`}>Continue learning</Link> : (
-          <form action={buy}>
-            <input type="hidden" name="courseId" value={course.id} />
-            <p><label>Promo code <input name="promo" maxLength={32} autoComplete="off" /></label></p>
-            <p>Any valid discount is applied to the final amount shown in Razorpay checkout.</p>
-            <p><label><input type="checkbox" name="terms" required /> I have read and accept the refund terms.</label></p>
-            <button type="submit">Buy Now</button>
-            <p>Secure checkout through Razorpay. Access is activated after payment verification.</p>
-          </form>
-        )}
-      </section>
-    </main>
+    <>
+      <SiteNav />
+      <main style={pageWrap}>
+        <p>
+          <Link href="/courses">← All courses</Link> · {course.category} · {course.level}
+        </p>
+        <h1 style={{ fontSize: 38, margin: "8px 0" }}>{course.title}</h1>
+        <p style={{ lineHeight: 1.7, color: "#526174", maxWidth: 720 }}>{course.description}</p>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 320px", gap: 20 }}>
+          <div>
+            {preview && youtubeId(preview.video_url) && (
+              <section style={{ ...cardStyle, marginBottom: 20 }}>
+                <h2 style={{ marginTop: 0 }}>Free preview — {preview.title}</h2>
+                <iframe
+                  title={preview.title}
+                  src={`https://www.youtube-nocookie.com/embed/${youtubeId(preview.video_url)}`}
+                  allow="accelerometer; autoplay; encrypted-media; picture-in-picture"
+                  allowFullScreen
+                  style={{ width: "100%", aspectRatio: "16 / 9", border: 0 }}
+                />
+              </section>
+            )}
+            <section style={cardStyle}>
+              <h2 style={{ marginTop: 0 }}>Curriculum</h2>
+              {!lessons.length && <p>No lessons published for this course yet.</p>}
+              {modules.map((module) => (
+                <div key={module.id}>
+                  <h3>{module.title}</h3>
+                  <ul style={{ lineHeight: 2 }}>
+                    {lessons.filter((l) => l.module_id === module.id).map((lesson) => (
+                      <li key={lesson.id}>
+                        {lesson.title}
+                        {lesson.is_free_preview ? " · Free preview" : ""}
+                        {lesson.duration_seconds ? ` · ${Math.round(lesson.duration_seconds / 60)} min` : ""}
+                      </li>
+                    ))}
+                  </ul>
+                </div>
+              ))}
+              {lessons.filter((l) => !l.module_id).map((lesson) => (
+                <p key={lesson.id}>{lesson.title}{lesson.is_free_preview ? " · Free preview" : ""}</p>
+              ))}
+            </section>
+          </div>
+          <aside style={cardStyle}>
+            <p style={{ fontSize: 30, fontWeight: 700, margin: "0 0 4px" }}>{money(course.price_paise)}</p>
+            <p style={{ color: "#526174", marginTop: 0 }}>One-time payment · 18% GST included at checkout</p>
+            {course.duration && <p><strong>Duration:</strong> {course.duration}</p>}
+            {course.instructor && <p><strong>Instructor:</strong> {course.instructor}</p>}
+            <p><strong>Lessons:</strong> {lessons.length || course.lessons_count}</p>
+            {enrolled ? (
+              <p><Link href={`/learn?course=${course.slug}`} style={{ display: "inline-block", background: "#0f766e", color: "#fff", padding: "12px 18px", borderRadius: 8, textDecoration: "none", fontWeight: 600 }}>Continue learning →</Link></p>
+            ) : (
+              <p>
+                <Link href={`/checkout?course=${course.slug}`} style={{ display: "inline-block", background: "#0f766e", color: "#fff", padding: "12px 18px", borderRadius: 8, textDecoration: "none", fontWeight: 600 }}>
+                  Buy Now →
+                </Link>
+              </p>
+            )}
+            <p style={{ fontSize: 13, color: "#526174", lineHeight: 1.7 }}>
+              Access is granted only after a verified captured Razorpay payment. Free courses unlock instantly.
+              Refund terms: contact support within 7 days of purchase with your order reference.
+            </p>
+            {!session && <p><Link href="/signup">Create an account</Link> to enrol.</p>}
+          </aside>
+        </div>
+      </main>
+      <SiteFooter />
+    </>
   );
 }
