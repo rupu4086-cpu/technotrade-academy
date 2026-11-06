@@ -60,6 +60,38 @@ function env(name: string) {
   if (!value) throw new Error(`Missing environment variable: ${name}`);
   return value;
 }
+// The academy_orders / academy_access tables are created automatically on
+// first checkout use (CREATE TABLE IF NOT EXISTS), so a Vercel deploy
+// works without a manual SQL step. They live in the same PostgreSQL
+// database (DATABASE_URL) as the records store in src/lib/store.ts.
+let tablesEnsured = false;
+async function ensureCheckoutTables(): Promise<void> {
+  if (tablesEnsured) return;
+  const pool = db();
+  await pool.query(`CREATE TABLE IF NOT EXISTS academy_orders (
+  id uuid PRIMARY KEY,
+  user_id uuid NOT NULL,
+  course_id text NOT NULL,
+  amount integer NOT NULL CHECK (amount > 0),
+  currency text NOT NULL CHECK (currency = 'INR'),
+  promo text,
+  status text NOT NULL CHECK (status IN ('pending','creation_failed','paid')),
+  razorpay_order_id text UNIQUE,
+  razorpay_payment_id text UNIQUE,
+  created_at timestamptz NOT NULL DEFAULT now(),
+  paid_at timestamptz
+)`);
+  await pool.query(`CREATE TABLE IF NOT EXISTS academy_access (
+  user_id uuid NOT NULL,
+  course_id text NOT NULL,
+  order_id uuid NOT NULL UNIQUE REFERENCES academy_orders(id),
+  granted_at timestamptz NOT NULL DEFAULT now(),
+  PRIMARY KEY (user_id, course_id)
+)`);
+  await pool.query("CREATE INDEX IF NOT EXISTS academy_orders_user_created ON academy_orders(user_id, created_at DESC)");
+  tablesEnsured = true;
+}
+
 function db() {
   return globalDB.academyPool ??= new Pool({
     connectionString: env("DATABASE_URL"), max: 5,
@@ -129,6 +161,7 @@ export async function POST(request: Request) {
       body = JSON.parse(raw);
       if (!body || typeof body !== "object" || Array.isArray(body)) throw new Error();
     } catch { throw new HttpError(400, "Invalid JSON request."); }
+    await ensureCheckoutTables();
     const user = await userId(request);
 
     if (body.action === "create") {

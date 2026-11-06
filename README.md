@@ -28,9 +28,13 @@ anywhere in this repo — all keys are supplied through environment variables.
 | `src/app/about/page.tsx`, `src/app/contact/page.tsx` | About, Contact |
 | `src/app/api/checkout/route.ts` | Checkout API — pending order first, Razorpay order, signature verify, grant access only after verified captured payment |
 | `src/app/manage/[private-path]/page.tsx` | Hidden admin (server role check) — draft/publish, promo management, enrolment/refund controls, Razorpay settings. No certificates. |
+| `src/app/layout.tsx`, `src/app/globals.css`, `tailwind.config.ts`, `postcss.config.js`, `tsconfig.json`, `next.config.js` | Next.js scaffold (Astra design tokens: deep navy, off-white, teal, Inter). |
+| `src/lib/store.ts` | Single records store: PostgreSQL `records` table via `pg` (auto-created). Replaces the old local SQLite file. |
+| `src/app/login/page.tsx`, `src/app/api/auth/session/route.ts` | Email-OTP sign-in that issues the `academy_session` cookie the learning/admin pages expect. |
+| `src/app/api/checkout/route.ts` | Checkout API — pending order first, Razorpay order, signature verify, grant access only after verified captured payment. Its `academy_orders` / `academy_access` tables are auto-created on first use. |
 | `prisma/schema.prisma` | users, courses, modules, lessons, enrollments, lesson_progress, orders, payments, promo_codes, promo_redemptions, webhook_events, enquiries, settings |
 | `public/logo.svg` | Astra's own logo for the academy |
-| `admin-app/` | **Separate admin app** (own Vercel project, own deployment). Dashboard, Courses/Modules/Lessons, Ads. Reads the same Supabase project. See `admin-app/README.md`. |
+| `admin-app/` | **Separate admin app** (own Vercel project, own deployment, Root Directory `admin-app/`). Dashboard, Courses/Modules/Lessons, Ads, Promo, Orders, Payments, Enquiries, Community. Reads the same Supabase project. See `admin-app/README.md`. |
 
 ## Environment variables
 
@@ -56,6 +60,8 @@ public website's client-side variables.
 | `SETTINGS_ENCRYPTION_KEY` | Encryption key for stored settings |
 | `APP_URL` | Public site URL, e.g. `https://technotrade-academy.vercel.app` |
 | `NEXT_PUBLIC_SUPPORT_EMAIL` | Support email shown on the site |
+| `CHECKOUT_PROMOS_JSON` | Optional JSON promo map for the checkout API (see `src/app/api/checkout/route.ts` header) |
+| `CLOUDFLARE_ACCOUNT_ID` / `CLOUDFLARE_STREAM_API_TOKEN` | Optional, for lesson video previews/playback |
 
 ## Local development
 
@@ -84,22 +90,69 @@ npm run dev
   idempotent webhooks. If Razorpay keys are not configured, checkout shows
   "Payment setup pending" and does not unlock anything.
 
-## Known gaps (from the Astra output — not yet fixed)
+## Fixed in the 2026-11-06 build pass
 
-The Astra files did not include the usual Next.js scaffold, so this repo will
-**not build as-is** until these are added:
+- Next.js scaffold added: `src/app/layout.tsx` (Inter font), `src/app/globals.css`
+  (Tailwind + navy/off-white/teal tokens), `tailwind.config.ts`,
+  `postcss.config.js`, `tsconfig.json`, `next.config.js`.
+- Missing dependencies added to `package.json`: `pg` (checkout route and
+  the records store) and `@supabase/supabase-js`, plus `@types/pg` (dev).
+- Store reconciled to **PostgreSQL as the single store**: the course-detail,
+  My Learning and hidden-admin pages no longer use `node:sqlite` / a local
+  `.data/academy.sqlite` file (which cannot persist on Vercel serverless).
+  They now use `src/lib/store.ts`, a `pg` pool over the same `DATABASE_URL`
+  as the checkout route; the `records` table is auto-created on first use.
+  Checkout promo/signature logic is unchanged: pending order first, access
+  only after a verified **captured** Razorpay payment, never before.
+  Thumbnails in the hidden admin are now stored as data URLs in the record
+  instead of files under `public/uploads/` (Vercel's filesystem is
+  ephemeral and read-only outside `/tmp`).
+- Admin app completed: `admin-app/` now has its own `package.json`,
+  `tsconfig.json`, `next.config.js`, root layout and stylesheet, and all
+  dashboard links work — Promo, Orders, Payments, Enquiries and Community
+  pages were added (see `admin-app/README.md`). The Dashboard revenue query
+  and the Courses page were corrected to the real Supabase column names
+  (`amount_paise`, `price_paise`, `position`, `category`, `level`).
+- Sign-in loop closed: `/login` (email OTP via Supabase) and
+  `POST /api/auth/session` now exist and issue the `academy_session`
+  cookie the learning/admin pages require. Admin role is granted only
+  when the verified email matches `ADMIN_EMAIL`.
+- `npm run build` passes for both projects (verified locally, Node 24):
+  public site 11 routes, admin app 8 routes.
 
-- `src/app/layout.tsx`, `src/app/globals.css`, `tailwind.config.*`,
-  `postcss.config.*`, `tsconfig.json`, `next.config.*` — none were supplied.
-- `pg` (used by `src/app/api/checkout/route.ts`) and `@supabase/supabase-js`
-  (used by `admin-app/src/lib/supabase-admin.ts`) are imported but are **not**
-  listed in `package.json` dependencies.
-- The public pages use a local SQLite-backed store in places
-  (`node:sqlite` in the course-detail / learn / admin pages), while the Prisma
-  schema targets PostgreSQL — the two stores need reconciling before launch.
-- The admin app's Promo, Orders, Payments, Enquiries and Community pages are
-  linked but not implemented (its own README says so); only Dashboard,
-  Courses/Modules/Lessons and Ads are in `admin-app/`.
-- The Supabase SQL schema for the tables lives in the owner's Supabase project
-  (15 tables already created there); Row Level Security is **off** and policies
-  still need to be added before a Supabase-backed deployment goes live.
+## Remaining known gaps (not fixed in this pass)
+
+- **Prisma schema vs the owner's Supabase schema do not match column-for-column.**
+  `prisma/schema.prisma` uses Prisma-style fields (`pricePaise`,
+  `course_modules.display_order` in the admin app's old contract, etc.)
+  while the Supabase tables actually created in the owner's project use
+  `price_paise`, `position`, `category`, `level`, `min_spend_paise`,
+  `used_count`, and so on (see `technotrade-supabase-schema.sql`). The
+  public site's Prisma client (`src/lib/pricing.ts`) is currently unused
+  by any page, and the pages that read/write data use either the `pg`
+  checkout tables or the `records` table — so the build passes, but do
+  **not** run `prisma migrate deploy` against the Supabase project until
+  the Prisma schema is aligned with the real tables, or it will try to
+  create a second, differently-shaped set of tables.
+- **Two checkout flows are not yet unified.** The Courses page +
+  `/api/checkout` flow grants access in the `academy_access` table; the
+  course-detail "Buy Now" + My Learning flow uses Razorpay payment links
+  and grants access in the `records` store. Both enforce "captured payment
+  first", but a purchase made through one flow is not visible to the
+  other's learning page yet.
+- **`/checkout` is a placeholder page.** It calls `/api/payments/create-order`
+  and `/api/payments/verify`, which do not exist; it correctly shows
+  "Payment setup pending" until enrolment is enabled. Real checkout is the
+  Courses page dialog, not this page.
+- **Row Level Security is off** on the owner's Supabase tables (as created
+  in the Supabase SQL Editor). Policies still need to be added before a
+  Supabase-backed deployment goes live.
+- **No live payment has been tested end-to-end.** Razorpay keys are not in
+  this repo (placeholders only in `.env.example`); the owner must set them
+  in Vercel and run a real test payment before taking money.
+- **Local-build note (this VM only):** `prisma generate` needs to download
+  Prisma engine binaries, and Node's fetch to `binaries.prisma.sh` fails
+  through this VM's proxy while `curl` works — the engines were downloaded
+  with `curl` into the local Prisma cache to make the local build pass.
+  Vercel's build environment has normal internet access, so this workaround
+  should not be needed there.

@@ -3,9 +3,6 @@ import Link from "next/link";
 import { cookies } from "next/headers";
 import { notFound, redirect } from "next/navigation";
 import { createDecipheriv, createHash, createHmac, timingSafeEqual, randomUUID } from "node:crypto";
-import { mkdirSync } from "node:fs";
-import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -25,17 +22,7 @@ type Order = {
   linkId: string; url: string; status: string; promo?: string; refundTerms: string; createdAt: string;
 };
 
-mkdirSync(join(process.cwd(), ".data"), { recursive: true });
-const db = new DatabaseSync(join(process.cwd(), ".data", "academy.sqlite"));
-db.exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS records (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-const get = <T,>(key: string): T | undefined => {
-  const row = db.prepare("SELECT value FROM records WHERE key=?").get(key) as { value: string } | undefined;
-  return row ? JSON.parse(row.value) : undefined;
-};
-const all = <T,>(prefix: string): T[] =>
-  (db.prepare("SELECT value FROM records WHERE key LIKE ?").all(`${prefix}%`) as { value: string }[]).map(r => JSON.parse(r.value));
-const put = (key: string, value: unknown) =>
-  db.prepare("INSERT INTO records VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(key, JSON.stringify(value));
+import { getRecord as get, allRecords as all, putRecord as put } from "@/lib/store";
 
 // Authentication must issue academy_session as an HttpOnly, Secure, SameSite=Lax
 // cookie: base64url(JSON session) + "." + base64url(HMAC-SHA256(payload)).
@@ -66,7 +53,7 @@ function decrypt(value?: string) {
 }
 
 async function paymentLink(body: unknown) {
-  const settings = get<{ keyId?: string; keySecret?: string }>("settings") || {};
+  const settings = await get<{ keyId?: string; keySecret?: string }>("settings") || {};
   const id = settings.keyId || process.env.RAZORPAY_KEY_ID;
   const secret = settings.keySecret ? decrypt(settings.keySecret) : process.env.RAZORPAY_KEY_SECRET;
   if (!id || !secret) throw new Error("Checkout is not configured.");
@@ -98,15 +85,15 @@ async function buy(form: FormData) {
   "use server";
   const user = await session();
   if (!user) redirect("/login?next=%2Flearn");
-  const course = get<Course>(`course:${String(form.get("courseId") || "")}`);
+  const course = await get<Course>(`course:${String(form.get("courseId") || "")}`);
   if (!course?.published) notFound();
   const back = `/courses/${encodeURIComponent(course.slug)}`;
-  if (get<Enrollment>(`enrollment:${user.sub}:${course.id}`)?.status === "active")
+  if ((await get<Enrollment>(`enrollment:${user.sub}:${course.id}`))?.status === "active")
     redirect(`/learn?course=${encodeURIComponent(course.id)}`);
   if (form.get("terms") !== "on") redirect(`${back}?error=terms`);
 
   const code = String(form.get("promo") || "").trim().toUpperCase();
-  const promo = code ? get<Promo>(`promo:${code}`) : undefined;
+  const promo = code ? await get<Promo>(`promo:${code}`) : undefined;
   if (code && (!promo?.active || (promo.courseId && promo.courseId !== course.id) ||
       (promo.expires && Date.parse(promo.expires) <= Date.now())))
     redirect(`${back}?error=promo`);
@@ -115,7 +102,7 @@ async function buy(form: FormData) {
   if (!Number.isSafeInteger(amount) || amount < 100) redirect(`${back}?error=price`);
 
   // Reuse an outstanding checkout to reduce accidental duplicate payments.
-  const pending = all<Order>("order:").find(order =>
+  const pending = (await all<Order>("order:")).find(order =>
     order.userId === user.sub && order.courseId === course.id &&
     order.status === "pending" && order.amount === amount && order.promo === code &&
     Date.now() - Date.parse(order.createdAt) < 25 * 60 * 1000);
@@ -136,7 +123,7 @@ async function buy(form: FormData) {
       notes: { userId: user.sub, courseId: course.id, promo: code },
     });
     if (!link.id || new URL(link.short_url).protocol !== "https:") throw new Error("Invalid checkout");
-    put(`order:${id}`, {
+    await put(`order:${id}`, {
       id, userId: user.sub, courseId: course.id, amount, currency: "INR",
       linkId: link.id, url: link.short_url, status: "pending", promo: code,
       refundTerms: course.refundTerms, createdAt: new Date().toISOString(),
@@ -154,10 +141,10 @@ export default async function CourseDetail({
 }) {
   const { slug } = await params;
   const { error } = await searchParams;
-  const course = all<Course>("course:").find(c => c.slug === slug && c.published);
+  const course = (await all<Course>("course:")).find(c => c.slug === slug && c.published);
   if (!course) notFound();
   const user = await session();
-  const owned = user && get<Enrollment>(`enrollment:${user.sub}:${course.id}`)?.status === "active";
+  const owned = user && (await get<Enrollment>(`enrollment:${user.sub}:${course.id}`))?.status === "active";
   const preview = course.lessons.find(l => l.id === course.previewLessonId && l.status === "ready");
   const token = preview?.videoId ? await previewToken(preview.videoId) : null;
   const errors: Record<string, string> = {

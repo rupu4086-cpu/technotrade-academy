@@ -10,7 +10,7 @@ type PaymentResult = { razorpay_order_id: string; razorpay_payment_id: string; r
 type RazorpayInstance = { open(): void; on(event: "payment.failed", callback: () => void): void };
 type RazorpayConstructor = new (options: {
   key: string; amount: number; currency: string; name: string; description: string;
-  order_id: string; prefill: { email: string }; theme: { color: string };
+  order_id: string; prefill?: { email: string }; theme: { color: string };
   handler: (result: PaymentResult) => void;
   modal: { ondismiss: () => void };
 }) => RazorpayInstance;

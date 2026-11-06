@@ -23,3 +23,7 @@ dist/
 *.log
 coverage/
 .vercel
+
+# local sqlite store (removed) and uploaded thumbnails
+.data/
+public/uploads/

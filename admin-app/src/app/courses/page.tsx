@@ -11,10 +11,12 @@ type Course = {
   title: string;
   slug: string;
   description: string | null;
-  price: number;
+  price_paise: number;
+  category: string;
+  level: string;
   status: string;
 };
-type Module = { id: string; course_id: string; title: string; display_order: number };
+type Module = { id: string; course_id: string; title: string; position: number };
 type Lesson = {
   id: string;
   module_id: string;
@@ -22,7 +24,7 @@ type Lesson = {
   video_url: string;
   video_type: string;
   is_free_preview: boolean;
-  display_order: number;
+  position: number;
 };
 type Kind = "course" | "module" | "lesson";
 
@@ -80,17 +82,27 @@ async function save(kind: Kind, form: FormData) {
       throw new Error("Use a lowercase, hyphen-separated slug.");
     }
     if (!["draft", "published"].includes(status)) throw new Error("Invalid status.");
+    const category = text(form, "category");
+    const level = text(form, "level");
+    if (!["Stock", "Crypto", "Forex", "Psychology", "Advanced"].includes(category)) {
+      throw new Error("Invalid category.");
+    }
+    if (!["Beginner", "Intermediate", "Advanced", "All levels"].includes(level)) {
+      throw new Error("Invalid level.");
+    }
     values = {
       title,
       slug,
       description: text(form, "description"),
-      price: integer(form, "price"),
+      price_paise: integer(form, "price_paise"),
+      category,
+      level,
       status,
     };
   } else if (kind === "module") {
     const course_id = text(form, "course_id");
     if (!course_id) throw new Error("Course is required.");
-    values = { title, course_id, display_order: integer(form, "display_order") };
+    values = { title, course_id, position: integer(form, "position") };
   } else {
     const module_id = text(form, "module_id");
     if (!module_id) throw new Error("Module is required.");
@@ -100,7 +112,7 @@ async function save(kind: Kind, form: FormData) {
       video_url: youtube(text(form, "video_url")),
       video_type: "youtube",
       is_free_preview: form.get("is_free_preview") === "on",
-      display_order: integer(form, "display_order"),
+      position: integer(form, "position"),
     };
   }
 
@@ -145,7 +157,19 @@ function CourseForm({ course }: { course?: Course }) {
       <label>Title <input name="title" defaultValue={course?.title} maxLength={200} required /></label>
       <label>Slug <input name="slug" defaultValue={course?.slug} pattern="[a-z0-9]+(-[a-z0-9]+)*" maxLength={200} required /></label>
       <label>Description <textarea name="description" defaultValue={course?.description ?? ""} rows={4} /></label>
-      <label>Price (INR paise) <input name="price" type="number" min={0} step={1} defaultValue={course?.price ?? 0} required /></label>
+      <label>Price (INR paise) <input name="price_paise" type="number" min={0} step={1} defaultValue={course?.price_paise ?? 0} required /></label>
+      <label>
+        Category
+        <select name="category" defaultValue={course?.category ?? "Stock"}>
+          {["Stock", "Crypto", "Forex", "Psychology", "Advanced"].map((c) => <option key={c} value={c}>{c}</option>)}
+        </select>
+      </label>
+      <label>
+        Level
+        <select name="level" defaultValue={course?.level ?? "Beginner"}>
+          {["Beginner", "Intermediate", "Advanced", "All levels"].map((l) => <option key={l} value={l}>{l}</option>)}
+        </select>
+      </label>
       <label>
         Status
         <select name="status" defaultValue={course?.status ?? "draft"}>
@@ -164,7 +188,7 @@ function ModuleForm({ courseId, module }: { courseId: string; module?: Module })
       {module && <input type="hidden" name="id" value={module.id} />}
       <input type="hidden" name="course_id" value={courseId} />
       <label>Module title <input name="title" defaultValue={module?.title} maxLength={200} required /></label>
-      <label>Display order <input name="display_order" type="number" min={0} step={1} defaultValue={module?.display_order ?? 0} required /></label>
+      <label>Display order <input name="position" type="number" min={0} step={1} defaultValue={module?.position ?? 0} required /></label>
       <button type="submit">{module ? "Save module" : "Add module"}</button>
     </form>
   );
@@ -179,7 +203,7 @@ function LessonForm({ moduleId, lesson }: { moduleId: string; lesson?: Lesson })
       <label>YouTube video URL <input name="video_url" type="url" defaultValue={lesson?.video_url} required /></label>
       <p>Video type: youtube</p>
       <label><input name="is_free_preview" type="checkbox" defaultChecked={lesson?.is_free_preview ?? false} /> Free preview</label>
-      <label>Display order <input name="display_order" type="number" min={0} step={1} defaultValue={lesson?.display_order ?? 0} required /></label>
+      <label>Display order <input name="position" type="number" min={0} step={1} defaultValue={lesson?.position ?? 0} required /></label>
       <button type="submit">{lesson ? "Save lesson" : "Add lesson"}</button>
     </form>
   );
@@ -205,9 +229,9 @@ async function loadAll<T>(table: string, columns: string, order: string): Promis
 export default async function CoursesPage() {
   await requireOwner();
   const [courses, modules, lessons] = await Promise.all([
-    loadAll<Course>("courses", "id,title,slug,description,price,status", "title"),
-    loadAll<Module>("course_modules", "id,course_id,title,display_order", "display_order"),
-    loadAll<Lesson>("course_lessons", "id,module_id,title,video_url,video_type,is_free_preview,display_order", "display_order"),
+    loadAll<Course>("courses", "id,title,slug,description,price_paise,category,level,status", "title"),
+    loadAll<Module>("course_modules", "id,course_id,title,position", "position"),
+    loadAll<Lesson>("course_lessons", "id,module_id,title,video_url,video_type,is_free_preview,position", "position"),
   ]);
 
   return (
@@ -230,13 +254,13 @@ export default async function CoursesPage() {
           <h3>Modules</h3>
           {modules.filter((module) => module.course_id === course.id).map((module) => (
             <details key={module.id} style={{ border: "1px solid #ccc", padding: 16, margin: "16px 0" }}>
-              <summary>{module.display_order}. {module.title}</summary>
+              <summary>{module.position}. {module.title}</summary>
               <ModuleForm courseId={course.id} module={module} />
               <DeleteForm kind="module" id={module.id} />
               <h4>Lessons</h4>
               {lessons.filter((lesson) => lesson.module_id === module.id).map((lesson) => (
                 <details key={lesson.id} style={{ padding: 12, margin: "12px 0", border: "1px solid #ddd" }}>
-                  <summary>{lesson.display_order}. {lesson.title}{lesson.is_free_preview ? " — Free preview" : ""}</summary>
+                  <summary>{lesson.position}. {lesson.title}{lesson.is_free_preview ? " — Free preview" : ""}</summary>
                   <LessonForm moduleId={module.id} lesson={lesson} />
                   <DeleteForm kind="lesson" id={lesson.id} />
                 </details>

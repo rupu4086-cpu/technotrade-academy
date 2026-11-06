@@ -10,24 +10,22 @@ type PaymentResult = {
   razorpay_signature: string;
 };
 type RazorpayInstance = {
-  open: () => void;
-  on: (event: "payment.failed", callback: () => void) => void;
+  open(): void;
+  on(event: "payment.failed", callback: () => void): void;
 };
-type RazorpayOptions = {
-  key: string;
-  order_id: string;
-  amount: number;
-  currency: string;
-  name: string;
-  description: string;
+// NOTE: this Window.Razorpay declaration must stay identical to the one in
+// src/app/courses/page.tsx — TypeScript requires merged global declarations
+// to have the same type.
+type RazorpayConstructor = new (options: {
+  key: string; amount: number; currency: string; name: string; description: string;
+  order_id: string; prefill?: { email: string }; theme: { color: string };
   handler: (result: PaymentResult) => void;
   modal: { ondismiss: () => void };
-  theme: { color: string };
-};
+}) => RazorpayInstance;
 
 declare global {
   interface Window {
-    Razorpay?: new (options: RazorpayOptions) => RazorpayInstance;
+    Razorpay?: RazorpayConstructor;
   }
 }
 

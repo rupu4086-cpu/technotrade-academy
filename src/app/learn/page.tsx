@@ -5,9 +5,6 @@ import { cookies } from "next/headers";
 import { redirect } from "next/navigation";
 import { revalidatePath } from "next/cache";
 import { createDecipheriv, createHash, createHmac, timingSafeEqual } from "node:crypto";
-import { mkdirSync } from "node:fs";
-import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
@@ -21,17 +18,7 @@ type Order = {
   linkId: string; status: string; createdAt: string;
 };
 
-mkdirSync(join(process.cwd(), ".data"), { recursive: true });
-const db = new DatabaseSync(join(process.cwd(), ".data", "academy.sqlite"));
-db.exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS records (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-const get = <T,>(key: string): T | undefined => {
-  const row = db.prepare("SELECT value FROM records WHERE key=?").get(key) as { value: string } | undefined;
-  return row ? JSON.parse(row.value) : undefined;
-};
-const all = <T,>(prefix: string): T[] =>
-  (db.prepare("SELECT value FROM records WHERE key LIKE ?").all(`${prefix}%`) as { value: string }[]).map(r => JSON.parse(r.value));
-const put = (key: string, value: unknown) =>
-  db.prepare("INSERT INTO records VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(key, JSON.stringify(value));
+import { getRecord as get, allRecords as all, putRecord as put } from "@/lib/store";
 
 async function requireUser(): Promise<Session> {
   const secret = process.env.SESSION_SECRET;
@@ -62,9 +49,9 @@ function decrypt(value: string) {
 }
 
 async function verifyPurchases(user: Session) {
-  const pending = all<Order>("order:").filter(o => o.userId === user.sub && o.status === "pending");
+  const pending = (await all<Order>("order:")).filter(o => o.userId === user.sub && o.status === "pending");
   if (!pending.length) return false;
-  const settings = get<{ keyId?: string; keySecret?: string }>("settings") || {};
+  const settings = await get<{ keyId?: string; keySecret?: string }>("settings") || {};
   let failed = false;
   try {
     const id = settings.keyId || process.env.RAZORPAY_KEY_ID;
@@ -81,23 +68,21 @@ async function verifyPurchases(user: Session) {
         if (link.status === "paid" && link.reference_id === order.id &&
             link.amount === order.amount && link.amount_paid === order.amount && link.currency === order.currency) {
           // Never trust callback query parameters as proof of payment.
-          db.exec("BEGIN IMMEDIATE");
           try {
-            const current = get<Order>(`order:${order.id}`);
+            const current = await get<Order>(`order:${order.id}`);
             if (current?.status === "pending") {
-              put(`order:${order.id}`, { ...current, status: "paid" });
+              await put(`order:${order.id}`, { ...current, status: "paid" });
               const key = `enrollment:${user.sub}:${order.courseId}`;
-              const existing = get<Enrollment>(key);
-              put(key, {
+              const existing = await get<Enrollment>(key);
+              await put(key, {
                 userId: user.sub, courseId: order.courseId, status: "active",
                 completed: existing?.completed || [], orderId: order.id,
               } satisfies Enrollment);
             }
-            db.exec("COMMIT");
-          } catch (error) { db.exec("ROLLBACK"); throw error; }
+          } catch (error) { throw error; }
         } else if (["expired", "cancelled"].includes(link.status)) {
-          const current = get<Order>(`order:${order.id}`);
-          if (current?.status === "pending") put(`order:${order.id}`, { ...current, status: link.status });
+          const current = await get<Order>(`order:${order.id}`);
+          if (current?.status === "pending") await put(`order:${order.id}`, { ...current, status: link.status });
         }
       } catch { failed = true; }
     }));
@@ -110,15 +95,13 @@ async function completeLesson(form: FormData) {
   const user = await requireUser();
   const courseId = String(form.get("courseId") || "");
   const lessonId = String(form.get("lessonId") || "");
-  const course = get<Course>(`course:${courseId}`);
+  const course = await get<Course>(`course:${courseId}`);
   const key = `enrollment:${user.sub}:${courseId}`;
-  db.exec("BEGIN IMMEDIATE");
   try {
-    const enrollment = get<Enrollment>(key);
+    const enrollment = await get<Enrollment>(key);
     if (enrollment?.status !== "active" || !course?.lessons.some(l => l.id === lessonId)) throw new Error("Access denied");
-    put(key, { ...enrollment, completed: [...new Set([...enrollment.completed, lessonId])] });
-    db.exec("COMMIT");
-  } catch (error) { db.exec("ROLLBACK"); throw error; }
+    await put(key, { ...enrollment, completed: [...new Set([...enrollment.completed, lessonId])] });
+  } catch (error) { throw error; }
   revalidatePath("/learn");
   const index = course!.lessons.findIndex(l => l.id === lessonId);
   const next = course!.lessons[index + 1] || course!.lessons[index];
@@ -146,9 +129,9 @@ export default async function MyLearning({
   const user = await requireUser();
   const verificationFailed = await verifyPurchases(user);
   const query = await searchParams;
-  const enrollments = all<Enrollment>("enrollment:").filter(e => e.userId === user.sub);
+  const enrollments = (await all<Enrollment>("enrollment:")).filter(e => e.userId === user.sub);
   const active = enrollments.filter(e => e.status === "active");
-  const courses = active.map(e => ({ enrollment: e, course: get<Course>(`course:${e.courseId}`) }))
+  const courses = (await Promise.all(active.map(async (e) => ({ enrollment: e, course: await get<Course>(`course:${e.courseId}`) }))))
     .filter((x): x is { enrollment: Enrollment; course: Course } => Boolean(x.course));
   const selected = courses.find(x => x.course.id === query.course) || courses[0];
   const course = selected?.course;
@@ -159,7 +142,12 @@ export default async function MyLearning({
   const resumeKey = lesson ? `academy:${user.sub}:${course!.id}:${lesson.id}` : "";
   const percent = (c: Course, e: Enrollment) => c.lessons.length
     ? Math.round(c.lessons.filter(l => e.completed.includes(l.id)).length / c.lessons.length * 100) : 0;
-  const hasPending = all<Order>("order:").some(o => o.userId === user.sub && o.status === "pending");
+  const hasPending = (await all<Order>("order:")).some(o => o.userId === user.sub && o.status === "pending");
+  const inactiveTitles = new Map<string, string>();
+  for (const e of enrollments.filter((x) => x.status !== "active")) {
+    const inactiveCourse = await get<Course>(`course:${e.courseId}`);
+    inactiveTitles.set(e.courseId, inactiveCourse?.title || "Course");
+  }
 
   return (
     <main style={{ maxWidth: 1100, margin: "auto", padding: 24 }}>
@@ -183,7 +171,7 @@ export default async function MyLearning({
           ))}
         </ul>
         {enrollments.filter(e => e.status !== "active").map(e => (
-          <p key={e.courseId}>{get<Course>(`course:${e.courseId}`)?.title || "Course"} — Access inactive ({e.status.replaceAll("_", " ")})</p>
+          <p key={e.courseId}>{inactiveTitles.get(e.courseId) || "Course"} — Access inactive ({e.status.replaceAll("_", " ")})</p>
         ))}
       </section>
       {course && lesson && enrollment && (

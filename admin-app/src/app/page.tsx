@@ -41,14 +41,14 @@ async function dashboardStats() {
   for (let offset = 0; ; ) {
     const { data, error } = await db
       .from("payments")
-      .select("id, amount")
+      .select("id, amount_paise")
       .eq("status", "captured")
       .order("id")
       .range(offset, offset + 499);
     if (error) throw new Error("Unable to load payment totals.");
     if (!data?.length) break;
     for (const payment of data) {
-      const amount = Number(payment.amount);
+      const amount = Number(payment.amount_paise);
       if (!Number.isFinite(amount)) throw new Error("Invalid payment amount.");
       revenue += amount;
     }

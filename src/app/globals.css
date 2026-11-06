@@ -1,0 +1,29 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+/*
+ * Astra design tokens: deep navy, off-white backgrounds, teal accents,
+ * Inter typography. Individual pages keep their own inline styles
+ * (home / courses use the dark theme, about / contact / checkout use the
+ * light theme); this file only provides the shared tokens, the Tailwind
+ * base, and the font — it does not set a page background.
+ */
+:root {
+  --navy: #0b1f3a;
+  --navy-deep: #081426;
+  --off-white: #f5f7fb;
+  --teal: #0f766e;
+  --teal-bright: #14b8a6;
+  --gold: #c48a25;
+}
+
+html {
+  scroll-behavior: smooth;
+}
+
+body {
+  font-family: var(--font-inter), Inter, system-ui, -apple-system, "Segoe UI", Arial, sans-serif;
+  color: #17253b;
+  background: var(--off-white);
+}

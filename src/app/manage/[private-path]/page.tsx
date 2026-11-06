@@ -2,15 +2,12 @@
 import { cookies } from "next/headers";
 import { notFound, redirect } from "next/navigation";
 import { createCipheriv, createDecipheriv, createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto";
-import { mkdirSync, writeFileSync } from "node:fs";
-import { join } from "node:path";
-import { DatabaseSync } from "node:sqlite";
 
 export const runtime = "nodejs";
 export const dynamic = "force-dynamic";
 export const metadata = { title: "Administration", robots: { index: false, follow: false } };
 
-// Requires persistent writable storage and Node.js with node:sqlite.
+// Data lives in PostgreSQL (see src/lib/store.ts). No local file storage.
 // SESSION_SECRET authenticates sessions; SETTINGS_ENCRYPTION_KEY encrypts secrets.
 // ADMIN_PRIVATE_PATH is a single, unguessable URL segment. It is not authentication.
 // Cloudflare Stream account credentials stay in server environment variables.
@@ -32,17 +29,7 @@ type Order = {
   linkId: string; status: string; refundId?: string; refundTerms: string;
 };
 
-mkdirSync(join(process.cwd(), ".data"), { recursive: true });
-const db = new DatabaseSync(join(process.cwd(), ".data", "academy.sqlite"));
-db.exec("PRAGMA journal_mode=WAL; PRAGMA busy_timeout=5000; CREATE TABLE IF NOT EXISTS records (key TEXT PRIMARY KEY, value TEXT NOT NULL)");
-const get = <T,>(key: string): T | undefined => {
-  const row = db.prepare("SELECT value FROM records WHERE key=?").get(key) as { value: string } | undefined;
-  return row ? JSON.parse(row.value) : undefined;
-};
-const all = <T,>(prefix: string): T[] =>
-  (db.prepare("SELECT value FROM records WHERE key LIKE ?").all(`${prefix}%`) as { value: string }[]).map(r => JSON.parse(r.value));
-const put = (key: string, value: unknown) =>
-  db.prepare("INSERT INTO records VALUES (?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value").run(key, JSON.stringify(value));
+import { getRecord as get, allRecords as all, putRecord as put } from "@/lib/store";
 
 async function requireAdmin(path: string) {
   if (!process.env.ADMIN_PRIVATE_PATH || path !== process.env.ADMIN_PRIVATE_PATH) notFound();
@@ -78,7 +65,7 @@ function decrypt(value: string) {
   return Buffer.concat([decipher.update(Buffer.from(ciphertext, "base64url")), decipher.final()]).toString();
 }
 async function razorpay(path: string, body?: unknown, idempotency?: string) {
-  const settings = get<Settings>("settings") || {};
+  const settings = await get<Settings>("settings") || {};
   const id = settings.keyId || process.env.RAZORPAY_KEY_ID;
   const secret = settings.keySecret ? decrypt(settings.keySecret) : process.env.RAZORPAY_KEY_SECRET;
   if (!id || !secret) throw new Error("Razorpay credentials are missing.");
@@ -113,8 +100,8 @@ function text(form: FormData, key: string, max = 10000) {
   return value;
 }
 const lines = (value: string) => value.split(/\r?\n/).map(s => s.trim()).filter(Boolean);
-function checkedCourse(id: string) {
-  const course = get<Course>(`course:${id}`);
+async function checkedCourse(id: string) {
+  const course = await get<Course>(`course:${id}`);
   if (!course) throw new Error("Course not found.");
   return course;
 }
@@ -127,14 +114,14 @@ async function manage(path: string, form: FormData) {
   try {
     if (action === "saveCourse") {
       const id = text(form, "courseId", 100) || randomUUID();
-      const old = get<Course>(`course:${id}`);
+      const old = await get<Course>(`course:${id}`);
       const slug = text(form, "slug", 100);
       const title = text(form, "title", 180);
       const price = Math.round(Number(text(form, "price", 20)) * 100);
       if (!/^[a-z0-9]+(?:-[a-z0-9]+)*$/.test(slug) || !title) throw new Error("Enter a title and a lowercase hyphenated slug.");
-      if (all<Course>("course:").some(c => c.slug === slug && c.id !== id)) throw new Error("This slug already exists.");
+      if ((await all<Course>("course:")).some(c => c.slug === slug && c.id !== id)) throw new Error("This slug already exists.");
       if (!Number.isSafeInteger(price) || price < 100 || price > 100000000) throw new Error("Enter a valid price between INR 1 and INR 1,000,000.");
-      put(`course:${id}`, {
+      await put(`course:${id}`, {
         ...old, id, slug, title, price, published: false,
         description: text(form, "description"),
         prerequisites: lines(text(form, "prerequisites")),
@@ -145,15 +132,15 @@ async function manage(path: string, form: FormData) {
       } satisfies Course);
       message = "Course saved as a draft. Review it before publishing.";
     } else if (action === "publish") {
-      const course = checkedCourse(text(form, "courseId", 100));
+      const course = await checkedCourse(text(form, "courseId", 100));
       const published = !course.published;
       if (published && (!course.description || !course.outcomes.length || !course.refundTerms ||
           !course.instructor.name || !course.instructor.bio || !course.lessons.length ||
           course.lessons.some(l => !l.videoId || l.status !== "ready")))
         throw new Error("Publishing requires complete details, refund terms, outcomes, instructor details, and ready videos for every lesson.");
-      put(`course:${course.id}`, { ...course, published });
+      await put(`course:${course.id}`, { ...course, published });
     } else if (action === "thumbnail") {
-      const course = checkedCourse(text(form, "courseId", 100));
+      const course = await checkedCourse(text(form, "courseId", 100));
       const file = form.get("thumbnail");
       if (!(file instanceof File) || !file.size || file.size > 500000) throw new Error("Upload a PNG, JPEG, or WebP image smaller than 500 KB.");
       const bytes = Buffer.from(await file.arrayBuffer());
@@ -161,23 +148,22 @@ async function manage(path: string, form: FormData) {
         : bytes[0] === 255 && bytes[1] === 216 && bytes[2] === 255 ? "jpg"
         : bytes.toString("ascii", 0, 4) === "RIFF" && bytes.toString("ascii", 8, 12) === "WEBP" ? "webp" : "";
       if (!ext) throw new Error("Unsupported image content.");
-      const directory = join(process.cwd(), "public", "uploads");
-      mkdirSync(directory, { recursive: true });
-      const filename = `${randomUUID()}.${ext}`;
-      writeFileSync(join(directory, filename), bytes, { flag: "wx" });
-      const current = checkedCourse(course.id);
-      put(`course:${course.id}`, { ...current, thumbnail: `/uploads/${filename}`, thumbnailStatus: "ready" });
+      // No file write: Vercel serverless storage is ephemeral and read-only
+      // outside /tmp, so the thumbnail is stored as a data URL in the record.
+      const mime = ext === "png" ? "image/png" : ext === "jpg" ? "image/jpeg" : "image/webp";
+      const current = await checkedCourse(course.id);
+      await put(`course:${course.id}`, { ...current, thumbnail: `data:${mime};base64,${bytes.toString("base64")}`, thumbnailStatus: "ready" });
     } else if (action === "addLesson") {
-      const course = checkedCourse(text(form, "courseId", 100));
+      const course = await checkedCourse(text(form, "courseId", 100));
       const title = text(form, "lessonTitle", 180);
       const minutes = Number(text(form, "minutes", 10));
       if (!title || !Number.isInteger(minutes) || minutes < 1 || minutes > 1440) throw new Error("Enter a lesson title and a duration from 1 to 1440 minutes.");
-      put(`course:${course.id}`, {
+      await put(`course:${course.id}`, {
         ...course, published: false,
         lessons: [...course.lessons, { id: randomUUID(), title, minutes, status: "missing" }],
       });
     } else if (["move", "preview", "video", "refreshVideo"].includes(action)) {
-      const course = checkedCourse(text(form, "courseId", 100));
+      const course = await checkedCourse(text(form, "courseId", 100));
       const lessonId = text(form, "lessonId", 100);
       const index = course.lessons.findIndex(l => l.id === lessonId);
       if (index < 0) throw new Error("Lesson not found.");
@@ -201,15 +187,15 @@ async function manage(path: string, form: FormData) {
           if (!id || !/^[a-f0-9]{32}$/i.test(id)) throw new Error("Upload a video first.");
           result = await stream(`/${id}`);
         }
-        const latest = checkedCourse(course.id);
+        const latest = await checkedCourse(course.id);
         const currentLesson = latest.lessons.find(l => l.id === lessonId);
         if (!currentLesson) throw new Error("Lesson no longer exists.");
         currentLesson.videoId = result.uid;
         currentLesson.status = result.readyToStream ? "ready" : result.status?.state || "processing";
         if (action === "video") latest.published = false;
-        put(`course:${course.id}`, latest);
+        await put(`course:${course.id}`, latest);
       }
-      if (action === "move" || action === "preview") put(`course:${course.id}`, course);
+      if (action === "move" || action === "preview") await put(`course:${course.id}`, course);
     } else if (action === "promo") {
       const code = text(form, "code", 32).toUpperCase();
       const percent = Number(text(form, "percent", 10));
@@ -217,9 +203,9 @@ async function manage(path: string, form: FormData) {
       const expires = text(form, "expires", 40);
       if (!/^[A-Z0-9_-]{2,32}$/.test(code) || !Number.isInteger(percent) || percent < 1 || percent > 99)
         throw new Error("Use a valid promo code and a whole-number discount from 1 to 99.");
-      if (courseId) checkedCourse(courseId);
+      if (courseId) await checkedCourse(courseId);
       if (expires && !Number.isFinite(Date.parse(expires))) throw new Error("Invalid expiration date.");
-      put(`promo:${code}`, {
+      await put(`promo:${code}`, {
         code, percent, courseId, expires: expires ? new Date(expires).toISOString() : "",
         active: form.get("active") === "on",
       } satisfies Promo);
@@ -228,14 +214,14 @@ async function manage(path: string, form: FormData) {
       const courseId = text(form, "courseId", 100);
       const status = text(form, "status", 30);
       if (!userId || !["active", "revoked"].includes(status)) throw new Error("Enter an authenticated user ID and a valid status.");
-      checkedCourse(courseId);
+      await checkedCourse(courseId);
       const key = `enrollment:${userId}:${courseId}`;
-      const old = get<Enrollment>(key);
-      put(key, { ...old, userId, courseId, status, completed: old?.completed || [] });
+      const old = await get<Enrollment>(key);
+      await put(key, { ...old, userId, courseId, status, completed: old?.completed || [] });
     } else if (action === "refund") {
       if (form.get("confirm") !== "on") throw new Error("Confirm the full refund.");
       const orderId = text(form, "orderId", 100);
-      let order = get<Order>(`order:${orderId}`);
+      let order = await get<Order>(`order:${orderId}`);
       if (!order || !["paid", "refund_pending", "refund_failed"].includes(order.status)) throw new Error("Select a paid order eligible for a refund.");
       if (!order.refundId) {
         const link = await razorpay(`payment_links/${encodeURIComponent(order.linkId)}`);
@@ -250,30 +236,30 @@ async function manage(path: string, form: FormData) {
           amount: order.amount, notes: { orderId: order.id, initiatedBy: actor },
         }, order.id);
         order = { ...order, refundId: refund.id, status: "refund_pending" };
-        put(`order:${order.id}`, order);
+        await put(`order:${order.id}`, order);
       }
       const refund = await razorpay(`refunds/${encodeURIComponent(order.refundId!)}`);
       const status = refund.status === "processed" ? "refunded" : refund.status === "failed" ? "refund_failed" : "refund_pending";
-      put(`order:${order.id}`, { ...order, status });
+      await put(`order:${order.id}`, { ...order, status });
       if (status === "refunded") {
         const key = `enrollment:${order.userId}:${order.courseId}`;
-        const enrollment = get<Enrollment>(key);
-        if (enrollment?.orderId === order.id) put(key, { ...enrollment, status: "refunded" });
+        const enrollment = await get<Enrollment>(key);
+        if (enrollment?.orderId === order.id) await put(key, { ...enrollment, status: "refunded" });
       }
       message = `Refund status: ${status.replaceAll("_", " ")}.`;
     } else if (action === "settings") {
-      const settings = get<Settings>("settings") || {};
+      const settings = await get<Settings>("settings") || {};
       const keyId = text(form, "keyId", 200);
       const keySecret = text(form, "keySecret", 500);
       const webhookSecret = text(form, "webhookSecret", 500);
       if (keyId && !/^rzp_(test|live)_[A-Za-z0-9]+$/.test(keyId)) throw new Error("Invalid Razorpay Key ID.");
-      put("settings", {
+      await put("settings", {
         keyId: keyId || settings.keyId,
         keySecret: keySecret ? encrypt(keySecret) : settings.keySecret,
         webhookSecret: webhookSecret ? encrypt(webhookSecret) : settings.webhookSecret,
       });
     } else throw new Error("Unknown operation.");
-    put(`audit:${randomUUID()}`, { actor, action, at: new Date().toISOString() });
+    await put(`audit:${randomUUID()}`, { actor, action, at: new Date().toISOString() });
   } catch (error) {
     message = error instanceof Error ? error.message : "Operation failed.";
   }
@@ -290,11 +276,11 @@ export default async function Admin({
   await requireAdmin(path);
   const { message } = await searchParams;
   const action = manage.bind(null, path);
-  const courses = all<Course>("course:");
-  const promos = all<Promo>("promo:");
-  const enrollments = all<Enrollment>("enrollment:");
-  const orders = all<Order>("order:");
-  const settings = get<Settings>("settings") || {};
+  const courses = await all<Course>("course:");
+  const promos = await all<Promo>("promo:");
+  const enrollments = await all<Enrollment>("enrollment:");
+  const orders = await all<Order>("order:");
+  const settings = await get<Settings>("settings") || {};
   const hidden = (name: string, value: string) => <input type="hidden" name={name} value={value} />;
   const courseOptions = courses.map(c => <option key={c.id} value={c.id}>{c.title}</option>);
 
